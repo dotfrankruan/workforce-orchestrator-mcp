@@ -6,10 +6,10 @@ import { DatabaseSync } from 'node:sqlite';
 import { WorkerStore, SCHEMA_V1 } from '../../db.js';
 import { makeTempDir, removeDir } from '../helpers.js';
 
-test('fresh database is created at schema v2', () => {
+test('fresh database is created at current schema version', () => {
   const dir = makeTempDir('kwm-mig-');
   const store = new WorkerStore(path.join(dir, 'workers.db'));
-  assert.equal(store.schemaVersion(), 2);
+  assert.equal(store.schemaVersion(), 3);
   store.close();
   removeDir(dir);
 });
@@ -35,7 +35,7 @@ test('v1 database migrates automatically and old rows stay readable', () => {
 
   // Opening with the new store must migrate in place.
   const store = new WorkerStore(dbPath);
-  assert.equal(store.schemaVersion(), 2);
+  assert.equal(store.schemaVersion(), 3);
 
   const row = store.getWorker('wk_legacy01');
   assert.ok(row, 'legacy row still readable');

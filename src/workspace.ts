@@ -159,3 +159,53 @@ export function prepareWorkspace(plan: PlannedWorkspace): void {
       break;
   }
 }
+
+/* ------------------------------------------------------------------ *
+ * Workflow workspaces: one shared workspace per workflow, so dependent
+ * tasks see upstream artifacts and git tasks share one branch.
+ * ------------------------------------------------------------------ */
+
+export function planWorkflowWorkspace(
+  type: WorkspaceType,
+  input: WorkspaceInput,
+  workerRoot: string,
+  workflowId: string,
+): PlannedWorkspace {
+  const logDir = safeJoinUnder(workerRoot, 'workflows', workflowId);
+  if (type === 'git_worktree') {
+    if (!input.repo_path) throw new Error('workspace.repo_path is required for git_worktree workflow');
+    const { repoRoot } = validateRepoPath(input.repo_path);
+    const baseSha = resolveRef(repoRoot, input.base_ref ?? 'HEAD');
+    return {
+      type,
+      cwd: path.join(logDir, 'worktree'),
+      artifactRoot: path.join(logDir, 'worktree'),
+      logDir,
+      repoPath: repoRoot,
+      baseRef: baseSha,
+      branch: `kimi-worker/${workflowId}`,
+    };
+  }
+  if (type === 'directory') {
+    if (!input.path) throw new Error('workspace.path is required for directory workflow');
+    let canonical: string;
+    try {
+      canonical = canonicalize(input.path);
+    } catch {
+      throw new Error(`workspace.path does not exist or is not readable: ${input.path}`);
+    }
+    if (!fs.statSync(canonical).isDirectory()) {
+      throw new Error(`workspace.path is not a directory: ${canonical}`);
+    }
+    if (path.parse(canonical).root === canonical) {
+      throw new Error('workspace.path must not be the filesystem root');
+    }
+    return { type, cwd: canonical, artifactRoot: canonical, logDir, repoPath: '', baseRef: '', branch: '' };
+  }
+  const cwd = path.join(logDir, 'workspace');
+  return { type: 'temporary', cwd, artifactRoot: cwd, logDir, repoPath: '', baseRef: '', branch: '' };
+}
+
+export function prepareWorkflowWorkspace(plan: PlannedWorkspace): void {
+  prepareWorkspace(plan);
+}

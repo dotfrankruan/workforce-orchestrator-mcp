@@ -4,6 +4,7 @@ import path from 'node:path';
 
 export type WorkerStatus =
   | 'queued'
+  | 'waiting_dependencies'
   | 'starting'
   | 'running'
   | 'completed'
@@ -11,8 +12,15 @@ export type WorkerStatus =
   | 'failed'
   | 'cancelled'
   | 'interrupted'
-  | 'timeout';
+  | 'timeout'
+  | 'blocked'
+  | 'budget_exceeded';
 
+/**
+ * Terminal states. Note: 'blocked' (dependencies permanently failed) and
+ * 'budget_exceeded' are terminal; 'waiting_dependencies' is NOT (it precedes
+ * the queue and does not consume a concurrency slot).
+ */
 export const TERMINAL_STATUSES: ReadonlySet<WorkerStatus> = new Set([
   'completed',
   'completed_uncommitted',
@@ -20,7 +28,30 @@ export const TERMINAL_STATUSES: ReadonlySet<WorkerStatus> = new Set([
   'cancelled',
   'interrupted',
   'timeout',
+  'blocked',
+  'budget_exceeded',
 ]);
+
+/** Statuses that satisfy an all_success dependency. Crisp definition: the task's deliverables/commits were fully verified. */
+export const SUCCESS_STATUSES: ReadonlySet<WorkerStatus> = new Set(['completed']);
+
+/** Statuses that permanently fail a dependent under all_success. */
+export const DEPENDENCY_FAILURE_STATUSES: ReadonlySet<WorkerStatus> = new Set([
+  'failed',
+  'cancelled',
+  'interrupted',
+  'timeout',
+  'blocked',
+  'budget_exceeded',
+  'completed_uncommitted',
+]);
+
+export type DependencyPolicy = 'all_success' | 'all_terminal';
+export type WorkflowStatus = 'running' | 'completed' | 'completed_with_failures' | 'failed' | 'cancelled';
+export type FailurePolicy = 'continue' | 'stop_dependents' | 'cancel_remaining';
+export type Acceptance = 'unreviewed' | 'accepted' | 'rejected' | 'needs_revision';
+export type CachePolicy = 'off' | 'read' | 'read_write' | 'refresh';
+export type Priority = 'low' | 'normal' | 'high';
 
 export function isTerminal(status: WorkerStatus): boolean {
   return TERMINAL_STATUSES.has(status);
@@ -58,6 +89,74 @@ export interface WorkerRow {
   continue_count: number;
   commit_followup_used: number;
   timeout_seconds: number | null;
+  // v3: orchestration
+  workflow_id: string | null;
+  task_key: string | null;
+  depends_on: string; // JSON array of task ids
+  dependency_policy: string;
+  role: string | null;
+  priority: string;
+  cache_policy: string;
+  execution_class: string | null;
+  acceptance: string;
+  budget: string | null; // JSON TaskBudget
+  attempt: number;
+  max_attempts: number;
+  retry_on: string; // JSON array of statuses
+}
+
+export interface WorkflowRow {
+  id: string;
+  name: string | null;
+  status: WorkflowStatus;
+  failure_policy: string;
+  budget: string | null; // JSON WorkflowBudget
+  metadata: string | null; // JSON object
+  preset: string | null;
+  workspace_type: string;
+  workspace_path: string;
+  repo_path: string;
+  base_ref: string;
+  branch: string;
+  log_dir: string;
+  created_at: string;
+  updated_at: string;
+  finished_at: string | null;
+}
+
+export interface AttemptRow {
+  id: number;
+  task_id: string;
+  attempt: number;
+  started_at: string | null;
+  finished_at: string | null;
+  exit_code: number | null;
+  status: string;
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_tokens: number;
+  error: string | null;
+}
+
+export interface ReviewRow {
+  id: number;
+  task_id: string;
+  decision: string;
+  feedback: string | null;
+  created_at: string;
+}
+
+export interface CacheRow {
+  cache_key: string;
+  task_id: string;
+  mode: string;
+  role: string | null;
+  workspace_fingerprint: string;
+  prompt_version: string;
+  artifact_count: number;
+  artifact_bytes: number;
+  hits: number;
+  created_at: string;
 }
 
 export interface WorkerPatch {
@@ -78,6 +177,9 @@ export interface WorkerPatch {
   continue_count?: number;
   commit_followup_used?: number;
   deliverables_missing?: string | null;
+  acceptance?: string;
+  attempt?: number;
+  max_attempts?: number;
 }
 
 export interface NewWorker {
@@ -93,6 +195,50 @@ export interface NewWorker {
   deliverables: string;
   capabilities: string;
   timeout_seconds: number | null;
+  // v3 (all optional — old call sites keep working)
+  workflow_id?: string | null;
+  task_key?: string | null;
+  depends_on?: string;
+  dependency_policy?: string;
+  role?: string | null;
+  priority?: string;
+  cache_policy?: string;
+  execution_class?: string | null;
+  budget?: string | null;
+  max_attempts?: number;
+  retry_on?: string;
+  initialStatus?: WorkerStatus;
+}
+
+export interface NewWorkflow {
+  id: string;
+  name: string | null;
+  failure_policy: string;
+  budget: string | null;
+  metadata: string | null;
+  preset: string | null;
+  workspace_type: string;
+  workspace_path: string;
+  repo_path: string;
+  base_ref: string;
+  branch: string;
+  log_dir: string;
+}
+
+export interface TaskBudget {
+  max_duration_seconds?: number;
+  max_input_tokens?: number;
+  max_output_tokens?: number;
+  max_total_tokens?: number;
+  max_tool_calls?: number;
+  max_iterations?: number;
+}
+
+export interface WorkflowBudget {
+  max_duration_seconds?: number;
+  max_kimi_tokens?: number;
+  max_concurrent_tasks?: number;
+  max_tasks?: number;
 }
 
 export interface ListFilter {
@@ -180,7 +326,91 @@ CREATE TABLE IF NOT EXISTS artifacts (
 CREATE INDEX IF NOT EXISTS idx_artifacts_task ON artifacts(task_id);
 `;
 
-const CURRENT_SCHEMA_VERSION = 2;
+const SCHEMA_V3_TABLES = `
+CREATE TABLE IF NOT EXISTS workflows (
+  id TEXT PRIMARY KEY,
+  name TEXT,
+  status TEXT NOT NULL DEFAULT 'running',
+  failure_policy TEXT NOT NULL DEFAULT 'stop_dependents',
+  budget TEXT,
+  metadata TEXT,
+  preset TEXT,
+  workspace_type TEXT NOT NULL,
+  workspace_path TEXT NOT NULL,
+  repo_path TEXT NOT NULL DEFAULT '',
+  base_ref TEXT NOT NULL DEFAULT '',
+  branch TEXT NOT NULL DEFAULT '',
+  log_dir TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  finished_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_workflows_status ON workflows(status);
+
+CREATE TABLE IF NOT EXISTS workflow_tasks (
+  workflow_id TEXT NOT NULL,
+  task_key TEXT NOT NULL,
+  task_id TEXT NOT NULL,
+  PRIMARY KEY (workflow_id, task_key)
+);
+CREATE INDEX IF NOT EXISTS idx_workflow_tasks_task ON workflow_tasks(task_id);
+
+CREATE TABLE IF NOT EXISTS task_attempts (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  task_id TEXT NOT NULL,
+  attempt INTEGER NOT NULL,
+  started_at TEXT,
+  finished_at TEXT,
+  exit_code INTEGER,
+  status TEXT,
+  input_tokens INTEGER NOT NULL DEFAULT 0,
+  output_tokens INTEGER NOT NULL DEFAULT 0,
+  cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+  error TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_attempts_task ON task_attempts(task_id);
+
+CREATE TABLE IF NOT EXISTS task_reviews (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  task_id TEXT NOT NULL,
+  decision TEXT NOT NULL,
+  feedback TEXT,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_reviews_task ON task_reviews(task_id);
+
+CREATE TABLE IF NOT EXISTS artifact_cache (
+  cache_key TEXT PRIMARY KEY,
+  task_id TEXT NOT NULL,
+  mode TEXT NOT NULL,
+  role TEXT,
+  workspace_fingerprint TEXT NOT NULL,
+  prompt_version TEXT NOT NULL,
+  artifact_count INTEGER NOT NULL DEFAULT 0,
+  artifact_bytes INTEGER NOT NULL DEFAULT 0,
+  hits INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL
+);
+`;
+
+/** Columns added to workers in schema v3 (name → DDL). */
+const WORKERS_V3_COLUMNS: Array<[string, string]> = [
+  ['workflow_id', `ALTER TABLE workers ADD COLUMN workflow_id TEXT`],
+  ['task_key', `ALTER TABLE workers ADD COLUMN task_key TEXT`],
+  ['depends_on', `ALTER TABLE workers ADD COLUMN depends_on TEXT NOT NULL DEFAULT '[]'`],
+  ['dependency_policy', `ALTER TABLE workers ADD COLUMN dependency_policy TEXT NOT NULL DEFAULT 'all_success'`],
+  ['role', `ALTER TABLE workers ADD COLUMN role TEXT`],
+  ['priority', `ALTER TABLE workers ADD COLUMN priority TEXT NOT NULL DEFAULT 'normal'`],
+  ['cache_policy', `ALTER TABLE workers ADD COLUMN cache_policy TEXT NOT NULL DEFAULT 'off'`],
+  ['execution_class', `ALTER TABLE workers ADD COLUMN execution_class TEXT`],
+  ['acceptance', `ALTER TABLE workers ADD COLUMN acceptance TEXT NOT NULL DEFAULT 'unreviewed'`],
+  ['budget', `ALTER TABLE workers ADD COLUMN budget TEXT`],
+  ['attempt', `ALTER TABLE workers ADD COLUMN attempt INTEGER NOT NULL DEFAULT 1`],
+  ['max_attempts', `ALTER TABLE workers ADD COLUMN max_attempts INTEGER NOT NULL DEFAULT 1`],
+  ['retry_on', `ALTER TABLE workers ADD COLUMN retry_on TEXT NOT NULL DEFAULT '["failed","timeout"]'`],
+];
+
+const CURRENT_SCHEMA_VERSION = 3;
 
 const ALL_COLUMNS = [
   'id', 'repo_path', 'base_ref', 'branch', 'worktree_path', 'log_dir', 'status', 'task',
@@ -189,6 +419,8 @@ const ALL_COLUMNS = [
   'commit_hash', 'final_text', 'last_progress', 'input_tokens', 'output_tokens',
   'cache_read_tokens', 'total_tokens_last', 'error', 'continue_count',
   'commit_followup_used', 'timeout_seconds',
+  'workflow_id', 'task_key', 'depends_on', 'dependency_policy', 'role', 'priority',
+  'cache_policy', 'execution_class', 'acceptance', 'budget', 'attempt', 'max_attempts', 'retry_on',
 ] as const;
 
 function rowToWorker(row: Record<string, unknown>): WorkerRow {
@@ -251,6 +483,14 @@ function migrate(db: DatabaseSync): void {
     version = 2;
   }
 
+  if (version < 3) {
+    for (const [col, ddl] of WORKERS_V3_COLUMNS) {
+      if (!columnExists(db, 'workers', col)) db.exec(ddl);
+    }
+    db.exec(SCHEMA_V3_TABLES);
+    version = 3;
+  }
+
   db.exec(`CREATE TABLE IF NOT EXISTS schema_meta (id INTEGER PRIMARY KEY CHECK (id = 1), version INTEGER NOT NULL)`);
   db.prepare(
     `INSERT INTO schema_meta (id, version) VALUES (1, ?)
@@ -286,12 +526,18 @@ export class WorkerStore {
     const now = new Date().toISOString();
     this.db
       .prepare(
-        `INSERT INTO workers (id, repo_path, base_ref, branch, worktree_path, log_dir, status, task, mode, workspace_type, deliverables, capabilities, created_at, updated_at, timeout_seconds)
-         VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO workers (id, repo_path, base_ref, branch, worktree_path, log_dir, status, task, mode, workspace_type, deliverables, capabilities, created_at, updated_at, timeout_seconds,
+           workflow_id, task_key, depends_on, dependency_policy, role, priority, cache_policy, execution_class, budget, max_attempts, retry_on)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
-        w.id, w.repo_path, w.base_ref, w.branch, w.worktree_path, w.log_dir, w.task,
-        w.mode, w.workspace_type, w.deliverables, w.capabilities, now, now, w.timeout_seconds,
+        w.id, w.repo_path, w.base_ref, w.branch, w.worktree_path, w.log_dir,
+        w.initialStatus ?? 'queued', w.task, w.mode, w.workspace_type, w.deliverables, w.capabilities,
+        now, now, w.timeout_seconds,
+        w.workflow_id ?? null, w.task_key ?? null, w.depends_on ?? '[]',
+        w.dependency_policy ?? 'all_success', w.role ?? null, w.priority ?? 'normal',
+        w.cache_policy ?? 'off', w.execution_class ?? null, w.budget ?? null,
+        w.max_attempts ?? 1, w.retry_on ?? '["failed","timeout"]',
       );
     return this.getWorker(w.id)!;
   }
@@ -336,6 +582,28 @@ export class WorkerStore {
     return rows.map(rowToWorker);
   }
 
+  workersByStatus(status: WorkerStatus): WorkerRow[] {
+    const rows = this.db
+      .prepare(`SELECT * FROM workers WHERE status = ? ORDER BY created_at ASC`)
+      .all(status) as Array<Record<string, unknown>>;
+    return rows.map(rowToWorker);
+  }
+
+  workersInWorkflow(workflowId: string): WorkerRow[] {
+    const rows = this.db
+      .prepare(`SELECT * FROM workers WHERE workflow_id = ? ORDER BY created_at ASC`)
+      .all(workflowId) as Array<Record<string, unknown>>;
+    return rows.map(rowToWorker);
+  }
+
+  /** Distinct active (running/starting) task counts per workflow. */
+  activeCountByWorkflow(): Map<string, number> {
+    const rows = this.db
+      .prepare(`SELECT workflow_id AS wf, COUNT(*) AS n FROM workers WHERE workflow_id IS NOT NULL AND status IN ('starting','running') GROUP BY workflow_id`)
+      .all() as Array<{ wf: string; n: number }>;
+    return new Map(rows.map((r) => [r.wf, r.n]));
+  }
+
   countByStatus(status: WorkerStatus): number {
     const row = this.db.prepare(`SELECT COUNT(*) AS n FROM workers WHERE status = ?`).get(status) as { n: number };
     return row.n;
@@ -358,6 +626,195 @@ export class WorkerStore {
       .prepare(`SELECT COUNT(*) AS n FROM worker_events WHERE worker_id = ? AND type = ?`)
       .get(workerId, type) as { n: number };
     return row.n;
+  }
+
+  /* ------------------------------ workflows ------------------------------ */
+
+  createWorkflow(w: NewWorkflow): WorkflowRow {
+    const now = new Date().toISOString();
+    this.db
+      .prepare(
+        `INSERT INTO workflows (id, name, status, failure_policy, budget, metadata, preset, workspace_type, workspace_path, repo_path, base_ref, branch, log_dir, created_at, updated_at)
+         VALUES (?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        w.id, w.name, w.failure_policy, w.budget, w.metadata, w.preset,
+        w.workspace_type, w.workspace_path, w.repo_path, w.base_ref, w.branch, w.log_dir, now, now,
+      );
+    return this.getWorkflow(w.id)!;
+  }
+
+  getWorkflow(id: string): WorkflowRow | null {
+    const row = this.db.prepare(`SELECT * FROM workflows WHERE id = ?`).get(id) as WorkflowRow | undefined;
+    return row ?? null;
+  }
+
+  updateWorkflow(id: string, patch: { status?: WorkflowStatus; finished_at?: string | null }): void {
+    const sets: string[] = [];
+    const vals: Array<string | null> = [];
+    if (patch.status !== undefined) {
+      sets.push('status = ?');
+      vals.push(patch.status);
+    }
+    if (patch.finished_at !== undefined) {
+      sets.push('finished_at = ?');
+      vals.push(patch.finished_at);
+    }
+    if (sets.length === 0) return;
+    this.db
+      .prepare(`UPDATE workflows SET ${sets.join(', ')}, updated_at = ? WHERE id = ?`)
+      .run(...vals, new Date().toISOString(), id);
+  }
+
+  listWorkflows(limit = 50): WorkflowRow[] {
+    return this.db
+      .prepare(`SELECT * FROM workflows ORDER BY created_at DESC LIMIT ?`)
+      .all(limit) as unknown as WorkflowRow[];
+  }
+
+  runningWorkflows(): WorkflowRow[] {
+    return this.db.prepare(`SELECT * FROM workflows WHERE status = 'running'`).all() as unknown as WorkflowRow[];
+  }
+
+  addWorkflowTask(workflowId: string, taskKey: string, taskId: string): void {
+    this.db
+      .prepare(`INSERT INTO workflow_tasks (workflow_id, task_key, task_id) VALUES (?, ?, ?)`)
+      .run(workflowId, taskKey, taskId);
+  }
+
+  workflowTaskMap(workflowId: string): Array<{ task_key: string; task_id: string }> {
+    return this.db
+      .prepare(`SELECT task_key, task_id FROM workflow_tasks WHERE workflow_id = ? ORDER BY rowid ASC`)
+      .all(workflowId) as Array<{ task_key: string; task_id: string }>;
+  }
+
+  /* ------------------------------ attempts ------------------------------ */
+
+  addAttempt(a: {
+    task_id: string;
+    attempt: number;
+    started_at: string | null;
+    finished_at: string | null;
+    exit_code: number | null;
+    status: string;
+    input_tokens: number;
+    output_tokens: number;
+    cache_read_tokens: number;
+    error: string | null;
+  }): void {
+    this.db
+      .prepare(
+        `INSERT INTO task_attempts (task_id, attempt, started_at, finished_at, exit_code, status, input_tokens, output_tokens, cache_read_tokens, error)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(a.task_id, a.attempt, a.started_at, a.finished_at, a.exit_code, a.status, a.input_tokens, a.output_tokens, a.cache_read_tokens, a.error);
+  }
+
+  listAttempts(taskId: string): AttemptRow[] {
+    return this.db
+      .prepare(`SELECT * FROM task_attempts WHERE task_id = ? ORDER BY attempt ASC`)
+      .all(taskId) as unknown as AttemptRow[];
+  }
+
+  /* ------------------------------ reviews ------------------------------ */
+
+  addReview(taskId: string, decision: string, feedback: string | null): void {
+    this.db
+      .prepare(`INSERT INTO task_reviews (task_id, decision, feedback, created_at) VALUES (?, ?, ?, ?)`)
+      .run(taskId, decision, feedback, new Date().toISOString());
+  }
+
+  listReviews(taskId: string): ReviewRow[] {
+    return this.db
+      .prepare(`SELECT * FROM task_reviews WHERE task_id = ? ORDER BY id ASC`)
+      .all(taskId) as unknown as ReviewRow[];
+  }
+
+  /** Acceptance/quality aggregation grouped by mode and role. */
+  acceptanceAgg(): Array<{
+    grp_mode: string;
+    grp_role: string;
+    total: number;
+    accepted: number;
+    rejected: number;
+    needs_revision: number;
+    failed: number;
+    avg_continues: number;
+  }> {
+    return this.db
+      .prepare(
+        `SELECT mode AS grp_mode, COALESCE(role, '') AS grp_role,
+           COUNT(*) AS total,
+           SUM(CASE WHEN acceptance = 'accepted' THEN 1 ELSE 0 END) AS accepted,
+           SUM(CASE WHEN acceptance = 'rejected' THEN 1 ELSE 0 END) AS rejected,
+           SUM(CASE WHEN acceptance = 'needs_revision' THEN 1 ELSE 0 END) AS needs_revision,
+           SUM(CASE WHEN status IN ('failed','timeout','budget_exceeded') THEN 1 ELSE 0 END) AS failed,
+           AVG(continue_count) AS avg_continues
+         FROM workers
+         GROUP BY mode, COALESCE(role, '')`,
+      )
+      .all() as unknown as Array<{
+      grp_mode: string; grp_role: string; total: number; accepted: number;
+      rejected: number; needs_revision: number; failed: number; avg_continues: number;
+    }>;
+  }
+
+  /* ------------------------------ cache ------------------------------ */
+
+  cacheGet(key: string): CacheRow | null {
+    const row = this.db.prepare(`SELECT * FROM artifact_cache WHERE cache_key = ?`).get(key) as CacheRow | undefined;
+    return row ?? null;
+  }
+
+  cachePut(c: Omit<CacheRow, 'hits'>): void {
+    this.db
+      .prepare(
+        `INSERT INTO artifact_cache (cache_key, task_id, mode, role, workspace_fingerprint, prompt_version, artifact_count, artifact_bytes, hits, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
+         ON CONFLICT(cache_key) DO UPDATE SET
+           task_id = excluded.task_id,
+           artifact_count = excluded.artifact_count,
+           artifact_bytes = excluded.artifact_bytes,
+           created_at = excluded.created_at`,
+      )
+      .run(c.cache_key, c.task_id, c.mode, c.role, c.workspace_fingerprint, c.prompt_version, c.artifact_count, c.artifact_bytes, c.created_at);
+  }
+
+  cacheHit(key: string): void {
+    this.db.prepare(`UPDATE artifact_cache SET hits = hits + 1 WHERE cache_key = ?`).run(key);
+  }
+
+  cacheStats(): { entries: number; hits: number; artifact_bytes: number } {
+    const row = this.db
+      .prepare(`SELECT COUNT(*) AS entries, COALESCE(SUM(hits),0) AS hits, COALESCE(SUM(artifact_bytes),0) AS artifact_bytes FROM artifact_cache`)
+      .get() as { entries: number; hits: number; artifact_bytes: number };
+    return row;
+  }
+
+  /* ------------------------------ aggregates ------------------------------ */
+
+  statusCounts(): Record<string, number> {
+    const rows = this.db.prepare(`SELECT status, COUNT(*) AS n FROM workers GROUP BY status`).all() as Array<{ status: string; n: number }>;
+    return Object.fromEntries(rows.map((r) => [r.status, r.n]));
+  }
+
+  tokenSums(): { input: number; output: number; cache_read: number } {
+    const row = this.db
+      .prepare(`SELECT COALESCE(SUM(input_tokens),0) AS input, COALESCE(SUM(output_tokens),0) AS output, COALESCE(SUM(cache_read_tokens),0) AS cache_read FROM workers`)
+      .get() as { input: number; output: number; cache_read: number };
+    return row;
+  }
+
+  avgContinues(): number {
+    const row = this.db.prepare(`SELECT COALESCE(AVG(continue_count),0) AS a FROM workers WHERE continue_count > 0 OR status IN ('completed','completed_uncommitted')`).get() as { a: number };
+    return row.a;
+  }
+
+  tokenSumsForWorkflow(wfId: string): { input: number; output: number; cache_read: number } {
+    const row = this.db
+      .prepare(`SELECT COALESCE(SUM(input_tokens),0) AS input, COALESCE(SUM(output_tokens),0) AS output, COALESCE(SUM(cache_read_tokens),0) AS cache_read FROM workers WHERE workflow_id = ?`)
+      .get(wfId) as { input: number; output: number; cache_read: number };
+    return row;
   }
 
   /* ------------------------------ artifacts ------------------------------ */

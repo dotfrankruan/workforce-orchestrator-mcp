@@ -4,10 +4,14 @@ import type { Config } from './config.js';
 import {
   WorkerStore,
   isTerminal,
+  DEPENDENCY_FAILURE_STATUSES,
   type WorkerRow,
   type WorkerStatus,
   type ListFilter,
   type ArtifactRow,
+  type WorkflowRow,
+  type TaskBudget,
+  type WorkflowBudget,
 } from './db.js';
 import { newWorkerId, isValidWorkerId } from './util/ids.js';
 import { pidAlive } from './util/paths.js';
@@ -40,6 +44,8 @@ import {
   isWorkspaceType,
   planWorkspace,
   prepareWorkspace,
+  planWorkflowWorkspace,
+  prepareWorkflowWorkspace,
   resolveModeAndWorkspace,
   type WorkspaceInput,
   type WorkspaceType,
@@ -85,6 +91,15 @@ export interface SpawnTaskParams {
   deliverables?: string[] | undefined;
   capabilities?: string[] | undefined;
   timeout_seconds?: number | undefined;
+  // v3 orchestration
+  depends_on?: string[] | undefined;
+  dependency_policy?: 'all_success' | 'all_terminal' | undefined;
+  role?: string | undefined;
+  priority?: 'low' | 'normal' | 'high' | undefined;
+  cache_policy?: 'off' | 'read' | 'read_write' | 'refresh' | undefined;
+  execution_class?: string | undefined;
+  budget?: TaskBudget | undefined;
+  retry?: { max_attempts: number; retry_on?: string[] } | undefined;
 }
 
 export interface SpawnTaskResult {
@@ -97,13 +112,25 @@ export interface SpawnTaskResult {
   queued: boolean;
 }
 
+/** Workflow task spec: dependencies use per-workflow keys, not task ids. */
+export interface WorkflowTaskInput {
+  key: string;
+  depends_on?: string[] | undefined; // keys within the same workflow
+  dependency_policy?: 'all_success' | 'all_terminal' | undefined;
+}
+
 interface ActiveRun {
   handle: WorkerBackendHandle;
   usage: UsageTracker;
-  intent: 'run' | 'cancel' | 'timeout';
+  intent: 'run' | 'cancel' | 'timeout' | 'budget';
   timeoutTimer: NodeJS.Timeout | null;
   /** HEAD captured when this run started (run-level git tracking). */
   headBeforeRun: string | null;
+  /** Run-local counters for budget enforcement. */
+  toolCalls: number;
+  lastTurn: number;
+  startedAt: string;
+  budgetInfo?: { reason: string; limit: number; used: number };
   done: Promise<void>;
   resolveDone: () => void;
 }
@@ -181,6 +208,22 @@ export class WorkerSupervisor {
       if (row.status === 'queued') continue; // will be scheduled below
       this.reconcileRow(row);
     }
+    // Workflows: recompute terminal state and re-arm duration budgets.
+    for (const wf of this.store.runningWorkflows()) {
+      const budget = this.workflowBudget(wf);
+      if (budget?.max_duration_seconds) {
+        const elapsedMs = Date.now() - Date.parse(wf.created_at);
+        const remainingMs = budget.max_duration_seconds * 1000 - elapsedMs;
+        if (remainingMs <= 0) {
+          this.failWorkflowForBudget(wf.id, `max_duration_seconds: ${budget.max_duration_seconds}s`);
+          continue;
+        }
+        const timer = setTimeout(() => this.failWorkflowForBudget(wf.id, `max_duration_seconds: ${budget.max_duration_seconds}s`), remainingMs);
+        timer.unref();
+        this.wfDeadlineTimers.set(wf.id, timer);
+      }
+      this.updateWorkflowState(wf.id);
+    }
     this.schedule();
   }
 
@@ -243,6 +286,22 @@ export class WorkerSupervisor {
    * ------------------------------------------------------------------ */
 
   spawnTask(params: SpawnTaskParams): SpawnTaskResult {
+    return this.spawnTaskInternal(params, null);
+  }
+
+  /**
+   * Internal spawn. When `workflowWorkspace` is given, the task uses the
+   * workflow's shared workspace instead of planning its own.
+   */
+  spawnTaskInternal(
+    params: SpawnTaskParams,
+    workflowCtx: {
+      workflow: WorkflowRow;
+      taskKey: string;
+      dependsOnIds: string[];
+      dependencyPolicy: string;
+    } | null,
+  ): SpawnTaskResult {
     if (!params.task || params.task.trim() === '') {
       throw new Error('task must be a non-empty string');
     }
@@ -254,23 +313,68 @@ export class WorkerSupervisor {
     const resolved = resolveModeAndWorkspace(mode, wsInput);
 
     let timeoutSeconds = params.timeout_seconds ?? this.config.defaultTimeoutSeconds;
+    if (params.budget?.max_duration_seconds) {
+      timeoutSeconds = Math.min(timeoutSeconds, params.budget.max_duration_seconds);
+    }
     if (timeoutSeconds <= 0) throw new Error('timeout_seconds must be positive');
     if (timeoutSeconds > this.config.maxTimeoutSeconds) timeoutSeconds = this.config.maxTimeoutSeconds;
 
     const deliverables = sanitizeDeliverables(params.deliverables);
     const capabilities = sanitizeCapabilities(params.capabilities);
 
+    // Dependencies (standalone tasks reference existing task ids directly).
+    const dependsOn = workflowCtx ? workflowCtx.dependsOnIds : [...new Set(params.depends_on ?? [])];
+    const dependencyPolicy = workflowCtx
+      ? workflowCtx.dependencyPolicy
+      : (params.dependency_policy ?? 'all_success');
+    if (dependencyPolicy !== 'all_success' && dependencyPolicy !== 'all_terminal') {
+      throw new Error(`invalid dependency_policy: ${JSON.stringify(dependencyPolicy)}`);
+    }
+    for (const dep of dependsOn) {
+      const depRow = this.store.getWorker(dep);
+      if (!depRow) throw new Error(`unknown dependency task: ${dep}`);
+      if (depRow.status === 'cancelled' && dependencyPolicy === 'all_success') {
+        // Still allowed: the dependency will simply never succeed → this task
+        // becomes blocked. Validated upfront for clearer feedback.
+      }
+    }
+
+    const priority = params.priority ?? 'normal';
+    if (!['low', 'normal', 'high'].includes(priority)) {
+      throw new Error(`invalid priority: ${JSON.stringify(priority)}`);
+    }
+    const cachePolicy = params.cache_policy ?? 'off';
+    if (!['off', 'read', 'read_write', 'refresh'].includes(cachePolicy)) {
+      throw new Error(`invalid cache_policy: ${JSON.stringify(cachePolicy)}`);
+    }
+    const maxAttempts = params.retry?.max_attempts ?? 1;
+    if (!Number.isInteger(maxAttempts) || maxAttempts < 1 || maxAttempts > 5) {
+      throw new Error('retry.max_attempts must be an integer between 1 and 5');
+    }
+    const retryOn = params.retry?.retry_on ?? ['failed', 'timeout'];
+
     // Unique worker id (collision-proof against the db).
     let id = newWorkerId();
     while (this.store.getWorker(id) !== null) id = newWorkerId();
 
     let plan: PlannedWorkspace;
-    try {
+    if (workflowCtx) {
+      // Shared workflow workspace; per-task logs under the workflow dir.
+      const wf = workflowCtx.workflow;
+      plan = {
+        type: wf.workspace_type as WorkspaceType,
+        cwd: wf.workspace_path,
+        artifactRoot: wf.workspace_path,
+        logDir: path.join(wf.log_dir, 'tasks', id),
+        repoPath: wf.repo_path,
+        baseRef: wf.base_ref,
+        branch: wf.branch,
+      };
+    } else {
       plan = planWorkspace(resolved.type, wsInput, { workerRoot: this.config.workerRoot, workerId: id });
       prepareWorkspace(plan);
-    } catch (err) {
-      throw err;
     }
+    fs.mkdirSync(plan.logDir, { recursive: true, mode: 0o700 });
 
     const row = this.store.createWorker({
       id,
@@ -285,11 +389,23 @@ export class WorkerSupervisor {
       deliverables: JSON.stringify(deliverables),
       capabilities: JSON.stringify(capabilities),
       timeout_seconds: timeoutSeconds,
+      workflow_id: workflowCtx?.workflow.id ?? null,
+      task_key: workflowCtx?.taskKey ?? null,
+      depends_on: JSON.stringify(dependsOn),
+      dependency_policy: dependencyPolicy,
+      role: params.role ?? null,
+      priority,
+      cache_policy: cachePolicy,
+      execution_class: params.execution_class ?? null,
+      budget: params.budget ? JSON.stringify(params.budget) : null,
+      max_attempts: maxAttempts,
+      retry_on: JSON.stringify(retryOn),
+      initialStatus: dependsOn.length > 0 ? 'waiting_dependencies' : 'queued',
     });
     this.store.addEvent(
       id,
       'spawn',
-      `mode=${resolved.mode} workspace=${plan.type}${plan.branch ? ` branch=${plan.branch} base=${plan.baseRef.slice(0, 12)}` : ''}`,
+      `mode=${resolved.mode} workspace=${plan.type}${plan.branch ? ` branch=${plan.branch}` : ''}${dependsOn.length ? ` deps=${dependsOn.join(',')}` : ''}${params.role ? ` role=${params.role}` : ''}`,
     );
 
     this.schedule();
@@ -301,7 +417,7 @@ export class WorkerSupervisor {
       workspace: { type: plan.type, path: plan.cwd },
       branch: plan.branch || null,
       session_id: null,
-      queued: true,
+      queued: row.status === 'queued',
     };
   }
 
@@ -530,6 +646,328 @@ export class WorkerSupervisor {
     };
   }
 
+  /* ------------------------------------------------------------------ *
+   * Workflows: orchestration containers over task DAGs
+   * ------------------------------------------------------------------ */
+
+  private wfDeadlineTimers = new Map<string, NodeJS.Timeout>();
+
+  /** Detect cycles in a key→dependency-keys graph. Returns a cycle path or null. */
+  static detectCycle(edges: Map<string, string[]>): string[] | null {
+    const WHITE = 0, GRAY = 1, BLACK = 2;
+    const color = new Map<string, number>();
+    const stack: string[] = [];
+    const dfs = (node: string): string[] | null => {
+      color.set(node, GRAY);
+      stack.push(node);
+      for (const dep of edges.get(node) ?? []) {
+        const c = color.get(dep) ?? WHITE;
+        if (c === GRAY) {
+          const idx = stack.indexOf(dep);
+          return [...stack.slice(idx), dep];
+        }
+        if (c === WHITE) {
+          const found = dfs(dep);
+          if (found) return found;
+        }
+      }
+      stack.pop();
+      color.set(node, BLACK);
+      return null;
+    };
+    for (const node of edges.keys()) {
+      if ((color.get(node) ?? WHITE) === WHITE) {
+        const found = dfs(node);
+        if (found) return found;
+      }
+    }
+    return null;
+  }
+
+  createWorkflow(input: {
+    name?: string | undefined;
+    tasks: Array<WorkflowTaskInput & SpawnTaskParams>;
+    budget?: WorkflowBudget | undefined;
+    metadata?: Record<string, unknown> | undefined;
+    preset?: string | undefined;
+    failure_policy?: string | undefined;
+    workspace?: WorkspaceInput | undefined;
+  }): Record<string, unknown> {
+    const tasks = input.tasks;
+    if (!Array.isArray(tasks) || tasks.length === 0) throw new Error('tasks must be a non-empty array');
+    const budget = input.budget ?? {};
+    if (budget.max_tasks && tasks.length > budget.max_tasks) {
+      throw new Error(`workflow has ${tasks.length} tasks, exceeding budget.max_tasks=${budget.max_tasks}`);
+    }
+
+    // Key validation + deterministic cycle detection on the key graph.
+    const keys = new Set<string>();
+    for (const t of tasks) {
+      if (!t.key || !/^[a-zA-Z0-9_-]{1,64}$/.test(t.key)) {
+        throw new Error(`invalid task key: ${JSON.stringify(t.key)} (use 1-64 chars of [a-zA-Z0-9_-])`);
+      }
+      if (keys.has(t.key)) throw new Error(`duplicate task key: ${t.key}`);
+      keys.add(t.key);
+    }
+    const edges = new Map<string, string[]>();
+    for (const t of tasks) {
+      const deps = t.depends_on ?? [];
+      for (const d of deps) {
+        if (!keys.has(d)) throw new Error(`task ${t.key} depends on unknown key: ${d}`);
+      }
+      edges.set(t.key, [...deps]);
+    }
+    const cycle = WorkerSupervisor.detectCycle(edges);
+    if (cycle) {
+      throw new Error(`dependency cycle detected: ${cycle.join(' → ')}`);
+    }
+
+    const failurePolicy = input.failure_policy ?? 'stop_dependents';
+    if (!['continue', 'stop_dependents', 'cancel_remaining'].includes(failurePolicy)) {
+      throw new Error(`invalid failure_policy: ${JSON.stringify(failurePolicy)}`);
+    }
+
+    let wfId = `wf_${newWorkerId().slice(3)}`;
+    while (this.store.getWorkflow(wfId) !== null) wfId = `wf_${newWorkerId().slice(3)}`;
+
+    // One shared workspace per workflow — dependents see upstream artifacts,
+    // and git workflows get a single branch the supervisor commits onto.
+    const wsInput = input.workspace ?? {};
+    const wsType = wsInput.type ?? (wsInput.repo_path ? 'git_worktree' : wsInput.path ? 'directory' : 'temporary');
+    const plan = planWorkflowWorkspace(wsType, wsInput, this.config.workerRoot, wfId);
+    prepareWorkflowWorkspace(plan);
+
+    const wf = this.store.createWorkflow({
+      id: wfId,
+      name: input.name ?? null,
+      failure_policy: failurePolicy,
+      budget: Object.keys(budget).length ? JSON.stringify(budget) : null,
+      metadata: input.metadata ? JSON.stringify(input.metadata) : null,
+      preset: input.preset ?? null,
+      workspace_type: plan.type,
+      workspace_path: plan.cwd,
+      repo_path: plan.repoPath,
+      base_ref: plan.baseRef,
+      branch: plan.branch,
+      log_dir: plan.logDir,
+    });
+
+    const mapping: Record<string, string> = {};
+    try {
+      for (const t of tasks) {
+        const depIds = (t.depends_on ?? []).map((k) => mapping[k]!);
+        const spawned = this.spawnTaskInternal(
+          { ...t },
+          {
+            workflow: wf,
+            taskKey: t.key,
+            dependsOnIds: depIds,
+            dependencyPolicy: t.dependency_policy ?? 'all_success',
+          },
+        );
+        mapping[t.key] = spawned.task_id;
+        this.store.addWorkflowTask(wf.id, t.key, spawned.task_id);
+      }
+    } catch (err) {
+      for (const id of Object.values(mapping)) {
+        void this.cancelWorker(id).catch(() => {});
+      }
+      this.store.updateWorkflow(wf.id, { status: 'failed', finished_at: new Date().toISOString() });
+      throw err;
+    }
+
+    if (budget.max_duration_seconds) {
+      const timer = setTimeout(
+        () => this.failWorkflowForBudget(wf.id, `max_duration_seconds: ${budget.max_duration_seconds}s`),
+        budget.max_duration_seconds * 1000,
+      );
+      timer.unref();
+      this.wfDeadlineTimers.set(wf.id, timer);
+    }
+
+    this.store.addEvent(wf.id, 'workflow', `created with ${tasks.length} tasks`);
+    return {
+      workflow_id: wf.id,
+      status: wf.status,
+      tasks: mapping,
+      workspace: { type: plan.type, path: plan.cwd },
+      branch: plan.branch || null,
+    };
+  }
+
+  private workflowOverview(wf: WorkflowRow): Record<string, unknown> {
+    const mapping = this.store.workflowTaskMap(wf.id);
+    const rows = this.store.workersInWorkflow(wf.id);
+    const byId = new Map(rows.map((r) => [r.id, r]));
+    const progress = { total: rows.length, completed: 0, running: 0, queued: 0, waiting: 0, blocked: 0, other_terminal: 0 };
+    const tasks = mapping.map(({ task_key, task_id }) => {
+      const r = byId.get(task_id);
+      if (!r) return { key: task_key, task_id, status: 'missing' };
+      if (r.status === 'completed' || r.status === 'completed_uncommitted') progress.completed++;
+      else if (r.status === 'running' || r.status === 'starting') progress.running++;
+      else if (r.status === 'queued') progress.queued++;
+      else if (r.status === 'waiting_dependencies') progress.waiting++;
+      else if (r.status === 'blocked') progress.blocked++;
+      else progress.other_terminal++;
+      return {
+        key: task_key,
+        task_id,
+        mode: r.mode,
+        role: r.role,
+        status: r.status,
+        acceptance: r.acceptance,
+        attempt: r.attempt,
+        depends_on: parseJsonArray(r.depends_on).map((d) => mapping.find((m) => m.task_id === d)?.task_key ?? d),
+        commit_hash: r.commit_hash ? r.commit_hash.slice(0, 7) : null,
+        error: r.error,
+      };
+    });
+    return {
+      workflow_id: wf.id,
+      name: wf.name,
+      status: wf.status,
+      preset: wf.preset,
+      failure_policy: wf.failure_policy,
+      budget: wf.budget ? (JSON.parse(wf.budget) as WorkflowBudget) : null,
+      workspace: { type: wf.workspace_type, path: wf.workspace_path },
+      branch: wf.branch || null,
+      progress,
+      tasks,
+      created_at: wf.created_at,
+      finished_at: wf.finished_at,
+    };
+  }
+
+  getWorkflow(id: string): Record<string, unknown> {
+    const wf = this.store.getWorkflow(id);
+    if (!wf) throw new Error(`unknown workflow: ${id}`);
+    return this.workflowOverview(wf);
+  }
+
+  listWorkflows(limit = 20): Array<Record<string, unknown>> {
+    return this.store.listWorkflows(limit).map((wf) => this.workflowOverview(wf));
+  }
+
+  async waitWorkflow(id: string, timeoutSeconds?: number): Promise<Record<string, unknown>> {
+    const wf0 = this.store.getWorkflow(id);
+    if (!wf0) throw new Error(`unknown workflow: ${id}`);
+    const timeout = validateWaitTimeout(timeoutSeconds, WAIT_TASKS_DEFAULT_SECONDS);
+    const start = Date.now();
+    const deadline = start + timeout * 1000;
+
+    let wf = wf0;
+    for (;;) {
+      wf = this.store.getWorkflow(id)!;
+      if (wf.status !== 'running' || Date.now() >= deadline) break;
+      await new Promise<void>((resolve) => {
+        const remaining = deadline - Date.now();
+        let remove: () => void = () => {};
+        const timer = setTimeout(() => {
+          remove();
+          resolve();
+        }, Math.min(remaining, WAIT_RECHECK_MS));
+        timer.unref();
+        remove = this.addWaiter(id, () => {
+          clearTimeout(timer);
+          resolve();
+        });
+      });
+    }
+    const waitedMs = Date.now() - start;
+    return {
+      ...this.workflowOverview(wf),
+      wait: {
+        completed: wf.status !== 'running',
+        timed_out: wf.status === 'running',
+        waited_seconds: Math.round(waitedMs / 100) / 10,
+        waited_ms: waitedMs,
+      },
+    };
+  }
+
+  async cancelWorkflow(id: string): Promise<Record<string, unknown>> {
+    const wf = this.store.getWorkflow(id);
+    if (!wf) throw new Error(`unknown workflow: ${id}`);
+    if (wf.status === 'running') {
+      this.store.updateWorkflow(id, { status: 'cancelled', finished_at: new Date().toISOString() });
+      for (const t of this.store.workersInWorkflow(id)) {
+        if (isTerminal(t.status)) continue;
+        await this.cancelWorker(t.id);
+      }
+      this.store.addEvent(id, 'workflow', 'cancelled');
+      this.notifyWaiters(id);
+      const timer = this.wfDeadlineTimers.get(id);
+      if (timer) {
+        clearTimeout(timer);
+        this.wfDeadlineTimers.delete(id);
+      }
+    }
+    return { workflow_id: id, status: this.store.getWorkflow(id)!.status };
+  }
+
+  /** Compact structured synthesis — no LLM summary; Codex does the final review. */
+  workflowResult(id: string): Record<string, unknown> {
+    const wf = this.store.getWorkflow(id);
+    if (!wf) throw new Error(`unknown workflow: ${id}`);
+    const overview = this.workflowOverview(wf);
+    const rows = this.store.workersInWorkflow(id);
+
+    const artifacts = rows.flatMap((r) =>
+      this.store.listArtifacts(r.id).map((a) => ({
+        task_key: r.task_key,
+        task_id: r.id,
+        path: a.relative_path,
+        size_bytes: a.size_bytes,
+        mime_type: a.mime_type,
+        sha256: a.sha256,
+      })),
+    );
+
+    const tokens = this.store.tokenSumsForWorkflow(id);
+    const warnings: string[] = [];
+    for (const r of rows) {
+      if (r.status === 'blocked' && r.error) {
+        warnings.push(`${r.task_key ?? r.id}: blocked ${redactSecrets(r.error)}`);
+      } else if (isTerminal(r.status) && r.status !== 'completed' && r.status !== 'completed_uncommitted') {
+        warnings.push(`${r.task_key ?? r.id}: ${r.status}${r.error ? ` — ${redactSecrets(r.error)}` : ''}`);
+      }
+      const missing = parseJsonArray(r.deliverables_missing);
+      if (missing.length) warnings.push(`${r.task_key ?? r.id}: missing deliverables ${missing.join(', ')}`);
+    }
+
+    const elapsed = Math.round(((wf.finished_at ? Date.parse(wf.finished_at) : Date.now()) - Date.parse(wf.created_at)) / 1000);
+
+    return {
+      workflow_id: wf.id,
+      name: wf.name,
+      status: wf.status,
+      preset: wf.preset,
+      tasks: {
+        total: rows.length,
+        completed: rows.filter((r) => r.status === 'completed' || r.status === 'completed_uncommitted').length,
+        failed: rows.filter((r) => isTerminal(r.status) && r.status !== 'completed' && r.status !== 'completed_uncommitted').length,
+      },
+      task_details: overview['tasks'],
+      artifacts,
+      metrics: {
+        duration_seconds: elapsed,
+        tokens: { input: tokens.input, output: tokens.output, cache_read: tokens.cache_read },
+        continues: rows.reduce((s, r) => s + r.continue_count, 0),
+        attempts: rows.reduce((s, r) => s + r.attempt, 0),
+      },
+      git: wf.workspace_type === 'git_worktree'
+        ? {
+            branch: wf.branch,
+            repo_path: wf.repo_path,
+            base_ref: wf.base_ref,
+            head: fs.existsSync(wf.workspace_path) ? currentHead(wf.workspace_path) : null,
+            working_tree_clean: fs.existsSync(wf.workspace_path) ? statusPorcelain(wf.workspace_path) === '' : null,
+          }
+        : null,
+      warnings,
+    };
+  }
+
   /* ------------------------------------------------------------------ */
 
   async continueWorker(workerId: string, instruction: string): Promise<{ worker_id: string; status: WorkerStatus; session_id: string | null }> {
@@ -537,7 +975,7 @@ export class WorkerSupervisor {
       throw new Error('instruction must be a non-empty string');
     }
     const row = this.get(workerId);
-    if (this.active.has(workerId) || row.status === 'running' || row.status === 'starting' || row.status === 'queued') {
+    if (this.active.has(workerId) || row.status === 'running' || row.status === 'starting' || row.status === 'queued' || row.status === 'waiting_dependencies') {
       throw new Error(`worker ${workerId} is still active; cancel it or wait for completion before continuing`);
     }
     if (!row.session_id) {
@@ -573,7 +1011,7 @@ export class WorkerSupervisor {
     }
 
     // Not supervised in this process. Maybe a stale running row with a pid.
-    if (row.status === 'queued') {
+    if (row.status === 'queued' || row.status === 'waiting_dependencies') {
       this.store.updateWorker(workerId, { status: 'cancelled', finished_at: new Date().toISOString() });
       this.store.addEvent(workerId, 'cancel', 'cancelled while queued');
       this.notifyWaiters(workerId);
@@ -621,9 +1059,14 @@ export class WorkerSupervisor {
     if (this.scheduling) return;
     this.scheduling = true;
     try {
+      this.promoteWaitingTasks();
+      const wfActive = this.store.activeCountByWorkflow();
       while (this.active.size < this.config.maxConcurrent) {
-        const next = this.oldestQueued();
+        const next = this.oldestQueued(wfActive);
         if (!next) break;
+        if (next.workflow_id) {
+          wfActive.set(next.workflow_id, (wfActive.get(next.workflow_id) ?? 0) + 1);
+        }
         this.startRun(next, { resumeSessionId: next.session_id });
       }
     } finally {
@@ -631,11 +1074,67 @@ export class WorkerSupervisor {
     }
   }
 
-  private oldestQueued(): WorkerRow | null {
-    // Queue is small in practice; pick the oldest queued worker (FIFO).
+  /**
+   * Dependency resolution pass: waiting_dependencies tasks move to queued
+   * when eligible, or to blocked (terminal) when a dependency permanently
+   * failed under their dependency policy.
+   */
+  private promoteWaitingTasks(): void {
+    for (const row of this.store.workersByStatus('waiting_dependencies')) {
+      const deps = parseJsonArray(row.depends_on);
+      const depRows = deps.map((d) => this.store.getWorker(d));
+      if (depRows.some((d) => !d)) {
+        // Dependency row vanished (shouldn't happen) → block.
+        this.blockTask(row, deps.map((d, i) => ({ task_id: d, status: depRows[i]?.status ?? 'missing' })));
+        continue;
+      }
+      const statuses = depRows.map((d) => (d as WorkerRow).status);
+      const allTerminal = statuses.every((s) => isTerminal(s));
+      if (!allTerminal) continue; // still waiting
+
+      const allSuccess = statuses.every((s) => s === 'completed');
+      const failedDeps = deps
+        .map((d, i) => ({ task_id: d, status: statuses[i]! }))
+        .filter((d) => DEPENDENCY_FAILURE_STATUSES.has(d.status as WorkerStatus));
+
+      if (row.dependency_policy === 'all_terminal') {
+        this.store.updateWorker(row.id, { status: 'queued' });
+        this.store.addEvent(row.id, 'deps_ready', `all_terminal satisfied (${deps.length} deps)`);
+      } else if (allSuccess) {
+        this.store.updateWorker(row.id, { status: 'queued' });
+        this.store.addEvent(row.id, 'deps_ready', `all_success satisfied (${deps.length} deps)`);
+      } else if (failedDeps.length > 0) {
+        this.blockTask(row, failedDeps);
+      }
+    }
+  }
+
+  /** Permanently block a task whose dependencies failed. */
+  private blockTask(row: WorkerRow, blockedBy: Array<{ task_id: string; status: string }>): void {
+    this.store.updateWorker(row.id, {
+      status: 'blocked',
+      error: JSON.stringify({ blocked_by: blockedBy }),
+      finished_at: new Date().toISOString(),
+    });
+    this.store.addEvent(row.id, 'blocked', blockedBy.map((b) => `${b.task_id}:${b.status}`).join(', '));
+    this.notifyWaiters(row.id);
+    this.onTaskTerminal(this.get(row.id));
+  }
+
+  private oldestQueued(wfActive?: Map<string, number>): WorkerRow | null {
+    // Priority first (high > normal > low), then FIFO by creation time.
     const all = this.store.listWorkers({ status: 'queued', limit: 500 });
-    all.sort((a, b) => a.created_at.localeCompare(b.created_at));
-    return all[0] ?? null;
+    const prio = (p: string) => (p === 'high' ? 0 : p === 'normal' ? 1 : 2);
+    all.sort((a, b) => prio(a.priority) - prio(b.priority) || a.created_at.localeCompare(b.created_at));
+    if (!wfActive) return all[0] ?? null;
+    // Honor per-workflow concurrency caps when selecting the next task.
+    for (const row of all) {
+      if (!row.workflow_id) return row;
+      const wf = this.store.getWorkflow(row.workflow_id);
+      const cap = this.workflowBudget(wf)?.max_concurrent_tasks;
+      if (!cap || (wfActive.get(row.workflow_id) ?? 0) < cap) return row;
+    }
+    return null;
   }
 
   private workspaceDescription(row: WorkerRow): string {
@@ -647,6 +1146,100 @@ export class WorkerSupervisor {
       default:
         return `Workspace: a fresh temporary directory at ${row.worktree_path}. Place all deliverables here.`;
     }
+  }
+
+  private workflowBudget(wf: WorkflowRow | null): WorkflowBudget | null {
+    if (!wf?.budget) return null;
+    try {
+      return JSON.parse(wf.budget) as WorkflowBudget;
+    } catch {
+      return null;
+    }
+  }
+
+  /* ------------------------- budget enforcement ------------------------- */
+
+  /**
+   * Best-effort budget checks driven by real DSH events (per status/tool
+   * event granularity — NOT hard accounting). On exceed, the run is
+   * terminated and the task lands in budget_exceeded.
+   */
+  private checkBudgets(workerId: string, run: ActiveRun): void {
+    if (run.intent !== 'run') return;
+    const row = this.store.getWorker(workerId);
+    if (!row) return;
+    const snap = run.usage.snapshot();
+
+    const setBudgetBreach = (reason: string, limit: number, used: number) => {
+      run.intent = 'budget';
+      run.budgetInfo = { reason, limit, used };
+      this.store.addEvent(workerId, 'budget', `${reason}: ${used}/${limit}; terminating`);
+      void run.handle.terminate(this.config.terminateGraceMs);
+    };
+
+    if (row.budget) {
+      let b: TaskBudget | null = null;
+      try {
+        b = JSON.parse(row.budget) as TaskBudget;
+      } catch {
+        b = null;
+      }
+      if (b) {
+        if (b.max_input_tokens && snap.input_tokens > b.max_input_tokens) {
+          return setBudgetBreach('max_input_tokens', b.max_input_tokens, snap.input_tokens);
+        }
+        if (b.max_output_tokens && snap.output_tokens > b.max_output_tokens) {
+          return setBudgetBreach('max_output_tokens', b.max_output_tokens, snap.output_tokens);
+        }
+        if (b.max_total_tokens && snap.input_tokens + snap.output_tokens + snap.cache_read_tokens > b.max_total_tokens) {
+          return setBudgetBreach('max_total_tokens', b.max_total_tokens, snap.input_tokens + snap.output_tokens + snap.cache_read_tokens);
+        }
+        if (b.max_tool_calls && run.toolCalls > b.max_tool_calls) {
+          return setBudgetBreach('max_tool_calls', b.max_tool_calls, run.toolCalls);
+        }
+        if (b.max_iterations && run.lastTurn > b.max_iterations) {
+          return setBudgetBreach('max_iterations', b.max_iterations, run.lastTurn);
+        }
+      }
+    }
+
+    // Workflow-level token budget (sum of input+output+cache across tasks).
+    if (row.workflow_id) {
+      const wf = this.store.getWorkflow(row.workflow_id);
+      const wb = this.workflowBudget(wf);
+      if (wf && wb?.max_kimi_tokens) {
+        const sums = this.store.tokenSumsForWorkflow(wf.id);
+        const used = sums.input + sums.output + sums.cache_read;
+        if (used > wb.max_kimi_tokens) {
+          this.store.addEvent(wf.id, 'budget', `workflow max_kimi_tokens exceeded: ${used}/${wb.max_kimi_tokens}`);
+          this.failWorkflowForBudget(wf.id, `max_kimi_tokens: ${used}/${wb.max_kimi_tokens}`);
+          return setBudgetBreach('workflow_max_kimi_tokens', wb.max_kimi_tokens, used);
+        }
+      }
+    }
+  }
+
+  private failWorkflowForBudget(wfId: string, reason: string): void {
+    const wf = this.store.getWorkflow(wfId);
+    if (!wf || wf.status !== 'running') return;
+    // Cancel everything not finished, then mark the workflow failed.
+    for (const t of this.store.workersInWorkflow(wfId)) {
+      if (isTerminal(t.status)) continue;
+      if (t.status === 'running' || t.status === 'starting') {
+        const run = this.active.get(t.id);
+        if (run) {
+          run.intent = 'budget';
+          run.budgetInfo = { reason: `workflow budget: ${reason}`, limit: 0, used: 0 };
+          void run.handle.terminate(this.config.terminateGraceMs);
+        }
+      } else {
+        this.store.updateWorker(t.id, { status: 'budget_exceeded', finished_at: new Date().toISOString(), error: JSON.stringify({ budget: { reason } }) });
+        this.notifyWaiters(t.id);
+      }
+    }
+    this.store.updateWorkflow(wfId, { status: 'failed', finished_at: new Date().toISOString() });
+    this.store.addEvent(wfId, 'workflow', `failed: budget exceeded (${reason})`);
+    this.notifyWaiters(wfId);
   }
 
   private buildPrompt(row: WorkerRow, isResume: boolean): string {
@@ -739,6 +1332,9 @@ export class WorkerSupervisor {
       // Run-level HEAD tracking: continue_worker runs must compare against
       // the previous run's HEAD, not the task's original base ref.
       headBeforeRun: row.workspace_type === 'git_worktree' ? currentHead(row.worktree_path) : null,
+      toolCalls: 0,
+      lastTurn: 0,
+      startedAt: new Date().toISOString(),
       done,
       resolveDone,
     };
@@ -768,6 +1364,7 @@ export class WorkerSupervisor {
 
   private handleEvent(workerId: string, ev: DshEvent, usage: UsageTracker): void {
     if (ev.usage) usage.apply(ev.usage);
+    const run = this.active.get(workerId);
 
     switch (ev.type) {
       case 'session': {
@@ -786,6 +1383,7 @@ export class WorkerSupervisor {
           total_tokens_last: snap.total_tokens_last,
         });
         if (ev.phase) this.store.addEvent(workerId, 'status', ev.phase);
+        if (ev.turn && run) run.lastTurn = Math.max(run.lastTurn, ev.turn);
         break;
       }
       case 'text': {
@@ -797,6 +1395,7 @@ export class WorkerSupervisor {
       }
       case 'tool_call': {
         this.store.addEvent(workerId, 'tool_call', `${ev.tool ?? '?'} (${ev.callId ?? '?'})`);
+        if (run) run.toolCalls++;
         break;
       }
       case 'tool_result': {
@@ -817,6 +1416,11 @@ export class WorkerSupervisor {
           this.store.addEvent(workerId, 'malformed', (ev.rawLine ?? '').slice(0, 120));
         }
       }
+    }
+
+    // Best-effort budget enforcement after every event.
+    if (run && (ev.type === 'status' || ev.type === 'tool_call')) {
+      this.checkBudgets(workerId, run);
     }
   }
 
@@ -1029,14 +1633,40 @@ export class WorkerSupervisor {
     const presetTerminal = isTerminal(row.status) ? row.status : null;
 
     const usageSnap = run.usage.snapshot();
-
-    const basePatch = {
-      pid: null,
+    const usagePatch = {
+      pid: null as number | null,
       exit_code: exitCode,
       input_tokens: usageSnap.input_tokens,
       output_tokens: usageSnap.output_tokens,
       cache_read_tokens: usageSnap.cache_read_tokens,
       total_tokens_last: usageSnap.total_tokens_last,
+    };
+
+    const finishTerminal = (status: WorkerStatus, error: string | null) => {
+      const now = new Date().toISOString();
+      this.store.addAttempt({
+        task_id: workerId,
+        attempt: row.attempt,
+        started_at: run.startedAt,
+        finished_at: now,
+        exit_code: exitCode,
+        status,
+        input_tokens: usageSnap.input_tokens,
+        output_tokens: usageSnap.output_tokens,
+        cache_read_tokens: usageSnap.cache_read_tokens,
+        error,
+      });
+      this.store.updateWorker(workerId, {
+        ...usagePatch,
+        commit_hash: this.collectGitFacts(row).commitHash ?? row.commit_hash,
+        status,
+        error,
+        finished_at: now,
+      });
+      this.store.addEvent(workerId, 'finish', `status=${status} exit=${exitCode ?? 'null'} attempt=${row.attempt}`);
+      this.finalizeArtifacts(this.get(workerId));
+      this.notifyWaiters(workerId);
+      this.onTaskTerminal(this.get(workerId));
     };
 
     if (run.intent === 'cancel' || presetTerminal !== null) {
@@ -1048,102 +1678,176 @@ export class WorkerSupervisor {
           headBefore: run.headBeforeRun,
         });
       }
-      this.store.updateWorker(workerId, {
-        ...basePatch,
-        commit_hash: this.collectGitFacts(row).commitHash ?? row.commit_hash,
-        status: presetTerminal ?? 'cancelled',
-        finished_at: row.finished_at ?? new Date().toISOString(),
-        error: presetTerminal ? row.error : null,
-      });
-      this.store.addEvent(workerId, 'cancel', `terminated (signal=${signal ?? 'n/a'})`);
-      this.finalizeArtifacts(this.get(workerId));
-      this.notifyWaiters(workerId);
+      finishTerminal(presetTerminal ?? 'cancelled', presetTerminal ? row.error : null);
       return;
     }
+
+    if (run.intent === 'budget') {
+      const info = run.budgetInfo ?? { reason: 'unknown', limit: 0, used: 0 };
+      finishTerminal(
+        'budget_exceeded',
+        JSON.stringify({ budget: { limit: info.limit, used: info.used, reason: info.reason } }),
+      );
+      return;
+    }
+
+    // Provisional outcome for run/timeout intents.
+    let provisional: WorkerStatus;
+    let provisionalError: string | null = null;
+    let gitFin: { workerCommitted: boolean; supervisorCommitted: boolean; commitError: string | null } | null = null;
 
     if (run.intent === 'timeout') {
-      if (row.workspace_type === 'git_worktree') {
-        const dirty = statusPorcelain(row.worktree_path) !== '';
-        this.recordGitFinalize(workerId, {
-          autoCommitSkipped: 'worker execution timed out — dirty working tree preserved',
-          workingTreeDirty: dirty,
-          headBefore: run.headBeforeRun,
-        });
-      }
-      this.store.updateWorker(workerId, {
-        ...basePatch,
-        commit_hash: this.collectGitFacts(row).commitHash ?? row.commit_hash,
-        status: 'timeout',
-        finished_at: new Date().toISOString(),
-        error: `exceeded timeout of ${row.timeout_seconds ?? this.config.defaultTimeoutSeconds}s`,
-      });
-      this.finalizeArtifacts(this.get(workerId));
-      this.notifyWaiters(workerId);
-      return;
-    }
-
-    const exitedCleanly = exitCode === 0;
-
-    let gitFin: { workerCommitted: boolean; supervisorCommitted: boolean; commitError: string | null } | null = null;
-    if (exitedCleanly && row.workspace_type === 'git_worktree') {
-      gitFin = this.finalizeGitChanges(row, run.headBeforeRun, row.final_text);
-      this.recordGitFinalize(workerId, {
-        headBefore: run.headBeforeRun,
-        headAfter: currentHead(row.worktree_path),
-        workerCommitted: gitFin.workerCommitted,
-        supervisorCommitted: gitFin.supervisorCommitted,
-        createdBy: gitFin.workerCommitted && gitFin.supervisorCommitted
-          ? 'worker+supervisor'
-          : gitFin.workerCommitted
-            ? 'worker'
-            : gitFin.supervisorCommitted
-              ? 'supervisor'
-              : null,
-        error: gitFin.commitError,
-      });
-    }
-
-    // Recompute after any supervisor commit.
-    const git = this.collectGitFacts(row);
-
-    let status: WorkerStatus;
-    let error: string | null = null;
-    if (!exitedCleanly) {
-      status = 'failed';
-      error = `dsh exited with code=${exitCode ?? 'null'} signal=${signal ?? 'null'}`;
-      if (row.workspace_type === 'git_worktree') {
-        this.recordGitFinalize(workerId, {
-          autoCommitSkipped: 'worker execution failed',
-          workingTreeDirty: git.dirty,
-          headBefore: run.headBeforeRun,
-        });
-      }
-    } else if (row.workspace_type !== 'git_worktree') {
-      status = 'completed';
-      error = row.final_text ? null : 'worker produced no final report';
-    } else if (gitFin?.commitError && git.dirty) {
-      status = 'completed_uncommitted';
-      error = gitFin.commitError;
-    } else if (git.dirty) {
-      status = 'completed_uncommitted';
-      error = 'worker finished but uncommitted modifications remain in the worktree';
+      provisional = 'timeout';
+      provisionalError = `exceeded timeout of ${row.timeout_seconds ?? this.config.defaultTimeoutSeconds}s`;
+    } else if (exitCode !== 0) {
+      provisional = 'failed';
+      provisionalError = `dsh exited with code=${exitCode ?? 'null'} signal=${signal ?? 'null'}`;
     } else {
-      status = 'completed';
-      if (!git.commitHash && !row.final_text) {
-        error = 'worker made no changes and produced no final report';
+      // Clean exit — supervisor-owned git finalization for git worktrees.
+      if (row.workspace_type === 'git_worktree') {
+        gitFin = this.finalizeGitChanges(row, run.headBeforeRun, row.final_text);
+        this.recordGitFinalize(workerId, {
+          headBefore: run.headBeforeRun,
+          headAfter: currentHead(row.worktree_path),
+          workerCommitted: gitFin.workerCommitted,
+          supervisorCommitted: gitFin.supervisorCommitted,
+          createdBy: gitFin.workerCommitted && gitFin.supervisorCommitted
+            ? 'worker+supervisor'
+            : gitFin.workerCommitted
+              ? 'worker'
+              : gitFin.supervisorCommitted
+                ? 'supervisor'
+                : null,
+          error: gitFin.commitError,
+        });
+      }
+      const git = this.collectGitFacts(row);
+      if (row.workspace_type !== 'git_worktree') {
+        provisional = 'completed';
+        provisionalError = row.final_text ? null : 'worker produced no final report';
+      } else if (gitFin?.commitError && git.dirty) {
+        provisional = 'completed_uncommitted';
+        provisionalError = gitFin.commitError;
+      } else if (git.dirty) {
+        provisional = 'completed_uncommitted';
+        provisionalError = 'worker finished but uncommitted modifications remain in the worktree';
+      } else {
+        provisional = 'completed';
+        if (!git.commitHash && !row.final_text) {
+          provisionalError = 'worker made no changes and produced no final report';
+        }
       }
     }
 
-    this.store.updateWorker(workerId, {
-      ...basePatch,
-      commit_hash: git.commitHash ?? row.commit_hash,
-      status,
-      error,
-      finished_at: new Date().toISOString(),
-    });
-    this.store.addEvent(workerId, 'finish', `status=${status} exit=${exitCode ?? 'null'}`);
-    this.finalizeArtifacts(this.get(workerId));
-    this.notifyWaiters(workerId);
+    // Retry gate: failed/timeout runs may be re-queued as a NEW run/session.
+    // Never retries cancelled/budget_exceeded. The task stays non-terminal
+    // (queued), so waiters are NOT woken for intermediate failures.
+    if (provisional === 'failed' || provisional === 'timeout') {
+      const retryOn = parseJsonArray(row.retry_on);
+      if (row.attempt < row.max_attempts && retryOn.includes(provisional)) {
+        this.store.addAttempt({
+          task_id: workerId,
+          attempt: row.attempt,
+          started_at: run.startedAt,
+          finished_at: new Date().toISOString(),
+          exit_code: exitCode,
+          status: provisional,
+          input_tokens: usageSnap.input_tokens,
+          output_tokens: usageSnap.output_tokens,
+          cache_read_tokens: usageSnap.cache_read_tokens,
+          error: provisionalError,
+        });
+        this.store.updateWorker(workerId, {
+          ...usagePatch,
+          exit_code: null,
+          status: 'queued',
+          error: null,
+          attempt: row.attempt + 1,
+          session_id: null, // MVP: retries always use a fresh session
+          started_at: row.started_at,
+        });
+        this.store.addEvent(workerId, 'retry', `attempt ${row.attempt} → ${row.attempt + 1} after ${provisional}`);
+        return;
+      }
+    }
+
+    if ((provisional === 'failed' || provisional === 'timeout') && row.workspace_type === 'git_worktree') {
+      this.recordGitFinalize(workerId, {
+        autoCommitSkipped: provisional === 'failed' ? 'worker execution failed' : 'worker execution timed out — dirty working tree preserved',
+        workingTreeDirty: statusPorcelain(row.worktree_path) !== '',
+        headBefore: run.headBeforeRun,
+      });
+    }
+
+    finishTerminal(provisional, provisionalError);
+  }
+
+  /** Workflow bookkeeping after any task reaches a terminal state. */
+  private onTaskTerminal(row: WorkerRow): void {
+    const wfId = row.workflow_id;
+    if (!wfId) return;
+    const wf = this.store.getWorkflow(wfId);
+    if (!wf || wf.status !== 'running') return;
+
+    // Crisp workflow health: only completed/completed_uncommitted are OK.
+    const failedTask = row.status !== 'completed' && row.status !== 'completed_uncommitted';
+
+    if (failedTask && wf.failure_policy === 'cancel_remaining') {
+      for (const t of this.store.workersInWorkflow(wfId)) {
+        if (t.id === row.id || isTerminal(t.status)) continue;
+        if (t.status === 'running' || t.status === 'starting') {
+          const r = this.active.get(t.id);
+          if (r) {
+            r.intent = 'cancel';
+            void r.handle.terminate(this.config.terminateGraceMs);
+          }
+        } else {
+          this.store.updateWorker(t.id, { status: 'cancelled', finished_at: new Date().toISOString(), error: 'cancelled: workflow failure_policy=cancel_remaining' });
+          this.store.addEvent(t.id, 'cancel', 'cancel_remaining policy');
+          this.notifyWaiters(t.id);
+        }
+      }
+    } else if (failedTask && wf.failure_policy === 'stop_dependents') {
+      // Transitively block downstream tasks still waiting on dependencies.
+      const tasks = this.store.workersInWorkflow(wfId);
+      const downstream = new Set<string>();
+      let changed = true;
+      downstream.add(row.id);
+      while (changed) {
+        changed = false;
+        for (const t of tasks) {
+          if (downstream.has(t.id) || isTerminal(t.status)) continue;
+          const deps = parseJsonArray(t.depends_on);
+          if (deps.some((d) => downstream.has(d))) {
+            downstream.add(t.id);
+            changed = true;
+          }
+        }
+      }
+      downstream.delete(row.id);
+      for (const id of downstream) {
+        const t = tasks.find((x) => x.id === id)!;
+        if (t.status === 'waiting_dependencies' || t.status === 'queued') {
+          this.blockTask(t, [{ task_id: row.id, status: row.status }]);
+        }
+      }
+    }
+
+    this.updateWorkflowState(wfId);
+  }
+
+  private updateWorkflowState(wfId: string): void {
+    const wf = this.store.getWorkflow(wfId);
+    if (!wf || wf.status !== 'running') return;
+    const tasks = this.store.workersInWorkflow(wfId);
+    if (tasks.length === 0) return;
+    if (tasks.some((t) => !isTerminal(t.status as WorkerStatus))) return;
+
+    const bad = tasks.filter((t) => t.status !== 'completed' && t.status !== 'completed_uncommitted');
+    const status = bad.length === 0 ? 'completed' : 'completed_with_failures';
+    this.store.updateWorkflow(wfId, { status, finished_at: new Date().toISOString() });
+    this.store.addEvent(wfId, 'workflow', `terminal: ${status} (${tasks.length - bad.length}/${tasks.length} ok)`);
+    this.notifyWaiters(wfId);
   }
 
   /* ------------------------------------------------------------------ */
