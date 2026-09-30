@@ -1,0 +1,535 @@
+import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import { z } from 'zod';
+import { WorkerSupervisor, elapsedSeconds } from '../supervisor.js';
+import { isValidWorkerId } from '../util/ids.js';
+import type { WorkerRow } from '../db.js';
+
+/**
+ * Server-level instructions, returned in the MCP initialize result.
+ * Keep the most important guidance first; stay concise.
+ */
+export const SERVER_INSTRUCTIONS = `Kimi Workforce is Codex's preferred execution backend for substantial, context-heavy, tool-heavy, or parallelizable work. Codex remains responsible for understanding the user's goal, planning, architecture, task decomposition, reviewing worker output, validating important claims, and final integration — the human user always has final control over intent.
+
+Delegate execution-heavy work when useful: broad repository exploration; implementation spanning multiple files/modules; running/debugging tests; lengthy shell/tool workflows; public web research and synthesis; data analysis/transformation; documentation generation; bulk file processing; independent review; parallelizable subtasks. Do not delegate trivial one-step work where delegation overhead exceeds the task.
+
+Workflow: spawn_task → continue Codex-side planning/review while workers run → wait_task / wait_tasks when results are actually needed → get_task_result (compact by default). Avoid repeated get_worker polling; get_worker is for one-off status inspection, and a wait timeout never cancels the worker. Fetch logs (get_worker_log), diffs (get_worker_diff), or artifact contents (get_artifact) only when needed. When delegated work needs substantial correction, prefer continue_worker on the same task/session over redoing the execution yourself or spawning a redundant task.`;
+
+function jsonResult(data: unknown): { content: Array<{ type: 'text'; text: string }> } {
+  return {
+    content: [{ type: 'text', text: JSON.stringify(data, null, 2) }],
+  };
+}
+
+function errorResult(err: unknown): { content: Array<{ type: 'text'; text: string }>; isError: true } {
+  const message = err instanceof Error ? err.message : String(err);
+  return { content: [{ type: 'text', text: `Error: ${message}` }], isError: true };
+}
+
+function compactStatus(row: WorkerRow): Record<string, unknown> {
+  return {
+    worker_id: row.id,
+    status: row.status,
+    mode: row.mode,
+    workspace_type: row.workspace_type,
+    session_id: row.session_id,
+    branch: row.branch || null,
+    worktree: row.worktree_path,
+    repo_path: row.repo_path || null,
+    elapsed_seconds: elapsedSeconds(row),
+    last_activity: row.last_progress ?? row.updated_at,
+    commit_hash: row.commit_hash ? row.commit_hash.slice(0, 7) : null,
+    error: row.error,
+    usage: {
+      input_tokens: row.input_tokens,
+      output_tokens: row.output_tokens,
+      cache_read_tokens: row.cache_read_tokens,
+      total_tokens_last: row.total_tokens_last,
+    },
+  };
+}
+
+function requireWorkerId(workerId: string): void {
+  if (!isValidWorkerId(workerId)) {
+    throw new Error(`invalid worker_id format: ${JSON.stringify(workerId)} (expected wk_xxxxxxxx)`);
+  }
+}
+
+const READ_ONLY = { readOnlyHint: true } as const;
+
+const ID_DESC = 'Task id returned by spawn_task / spawn_worker (wk_xxxxxxxx). Both id spaces are the same.';
+const TASK_DESC =
+  'A bounded, outcome-oriented assignment for the worker. Include the desired result and important constraints, but leave implementation-level exploration to the worker when appropriate.';
+const TIMEOUT_DESC =
+  'Max run time in seconds before the worker is terminated. Raise it for long builds, large test suites, or deep research; lower it for quick experiments.';
+const DELIVERABLES_DESC =
+  'Named files the worker must produce in its workspace (relative paths, verified on disk at completion). Prefer deliverables for substantial reports/data instead of returning large content inline.';
+const CAPABILITIES_DESC =
+  'Requested/intended capability set for the task (e.g. filesystem.read, filesystem.write, shell, web.search, web.fetch, git). Recorded on the task and injected into the worker prompt as advisory guidance — this is NOT a hard security sandbox.';
+const MODE_DESC =
+  'Task mode: code (implement/fix/test/commit in a git worktree), research (investigate and synthesize; writes report + sources.json), data (analyze datasets; inputs read-only), docs (documentation), file (batch file ops, no deletion unless asked), ops (diagnostics; no sudo/destructive changes, produces proposals), review (read-only code review), general (default).';
+
+export function createMcpServer(supervisor: WorkerSupervisor): McpServer {
+  const server = new McpServer(
+    { name: 'kimi-workforce-mcp', version: '0.2.0' },
+    { capabilities: { logging: {} }, instructions: SERVER_INSTRUCTIONS },
+  );
+
+  server.registerTool(
+    'spawn_task',
+    {
+      title: 'Spawn Kimi task (any mode)',
+      description:
+        'Delegate substantial execution work to a Kimi K3 worker.\n\n' +
+        'Use proactively when a task involves significant repository exploration, implementation, testing/debugging, long tool trajectories, research, data analysis, documentation, file processing, independent review, or work that can beneficially run in parallel. Multiple independent tasks may run in parallel.\n\n' +
+        'Codex should normally retain planning, architectural decisions, review, validation, and final integration.\n\n' +
+        'Avoid using this tool for tiny edits or trivial one-step operations where delegation overhead exceeds the task.\n\n' +
+        'Returns immediately with a task id; when the result is needed use wait_task / wait_tasks (not get_worker polling), then inspect get_task_result. Workers write substantial output to workspace files (see deliverables) instead of returning it inline.\n\n' +
+        'For isolated git coding tasks the worker modifies and tests the worktree; the workforce supervisor finalizes successful changes into a worker-branch commit automatically — no commit instructions needed in the task text.',
+      inputSchema: {
+        task: z.string().describe(TASK_DESC),
+        mode: z.enum(['code', 'research', 'data', 'docs', 'file', 'ops', 'review', 'general']).optional().describe(MODE_DESC),
+        workspace: z
+          .object({
+            type: z
+              .enum(['git_worktree', 'directory', 'temporary'])
+              .optional()
+              .describe('Where the worker operates. Default: git_worktree for code/review with repo_path, directory when path is given, otherwise temporary.'),
+            path: z.string().optional().describe('For directory workspace: an existing directory the worker may operate in (canonicalized; nothing outside it is touched).'),
+            repo_path: z.string().optional().describe('For git_worktree: path inside the target git repository.'),
+            base_ref: z.string().optional().describe('For git_worktree: git ref to branch from (default: current HEAD).'),
+          })
+          .optional()
+          .describe('Where the worker runs. Omit for a fresh temporary workspace.'),
+        deliverables: z.array(z.string()).optional().describe(DELIVERABLES_DESC),
+        capabilities: z.array(z.string()).optional().describe(CAPABILITIES_DESC),
+        timeout_seconds: z.number().int().positive().optional().describe(TIMEOUT_DESC),
+      },
+      annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
+    },
+    async ({ task, mode, workspace, deliverables, capabilities, timeout_seconds }) => {
+      try {
+        const result = supervisor.spawnTask({ task, mode, workspace, deliverables, capabilities, timeout_seconds });
+        return jsonResult(result);
+      } catch (err) {
+        return errorResult(err);
+      }
+    },
+  );
+
+  server.registerTool(
+    'wait_task',
+    {
+      title: 'Wait for one task (efficient)',
+      description:
+        'Efficiently wait for one delegated task to reach a terminal state (completed / completed_uncommitted / failed / cancelled / timeout / interrupted).\n\n' +
+        'Prefer this over repeatedly polling get_worker after spawning a task. The call returns when the task finishes or the wait timeout expires. While waiting, Codex can simply not call anything — do independent planner/reviewer work first, then wait when the result is actually needed.\n\n' +
+        'A wait timeout does NOT cancel or fail the worker; it only means "still running, decide whether to wait again". On completion the compact task result is included.',
+      inputSchema: {
+        task_id: z.string().describe(ID_DESC),
+        timeout_seconds: z
+          .number()
+          .int()
+          .min(1)
+          .max(600)
+          .optional()
+          .describe('How long to wait (default 60, max 600). This is only the wait budget — it does not affect the worker\'s own execution timeout.'),
+      },
+      annotations: READ_ONLY,
+    },
+    async ({ task_id, timeout_seconds }) => {
+      try {
+        requireWorkerId(task_id);
+        return jsonResult(await supervisor.waitTask(task_id, timeout_seconds));
+      } catch (err) {
+        return errorResult(err);
+      }
+    },
+  );
+
+  server.registerTool(
+    'wait_tasks',
+    {
+      title: 'Wait for multiple tasks (efficient)',
+      description:
+        'Efficiently wait for multiple delegated tasks.\n\n' +
+        'Use this after spawning independent tasks in parallel instead of repeatedly polling each task with get_worker.\n\n' +
+        'Use return_when="all" when all delegated tracks are needed before review (note: "all" means all terminal — a mix of completed and failed still satisfies it). Use return_when="any" when Codex can begin processing whichever task finishes first; triggered_by lists the task(s) that finished.\n\n' +
+        'The wait timeout does not cancel unfinished workers — it only bounds this call.',
+      inputSchema: {
+        task_ids: z.array(z.string()).min(1).max(32).describe('Task ids to wait on (duplicates are removed).'),
+        return_when: z.enum(['all', 'any']).optional().describe('"all" (default): wait until every task is terminal. "any": return as soon as one task is terminal.'),
+        timeout_seconds: z
+          .number()
+          .int()
+          .min(1)
+          .max(600)
+          .optional()
+          .describe('How long to wait (default 120, max 600). Does not affect the workers\' own execution timeouts.'),
+      },
+      annotations: READ_ONLY,
+    },
+    async ({ task_ids, return_when, timeout_seconds }) => {
+      try {
+        for (const id of task_ids) requireWorkerId(id);
+        return jsonResult(await supervisor.waitTasks(task_ids, return_when ?? 'all', timeout_seconds));
+      } catch (err) {
+        return errorResult(err);
+      }
+    },
+  );
+
+  server.registerTool(
+    'spawn_tasks',
+    {
+      title: 'Spawn multiple Kimi tasks',
+      description:
+        'Batch-spawn several independent tasks in one call (each gets its own workspace and session). Combine with wait_tasks for parallel delegation: spawn_tasks → do Codex-side work → wait_tasks(return_when="all") → review each result.\n\n' +
+        'Per-item success/error is returned; one invalid item does not roll back the others.',
+      inputSchema: {
+        tasks: z
+          .array(
+            z.object({
+              task: z.string().describe(TASK_DESC),
+              mode: z.enum(['code', 'research', 'data', 'docs', 'file', 'ops', 'review', 'general']).optional().describe(MODE_DESC),
+              workspace: z
+                .object({
+                  type: z.enum(['git_worktree', 'directory', 'temporary']).optional(),
+                  path: z.string().optional(),
+                  repo_path: z.string().optional(),
+                  base_ref: z.string().optional(),
+                })
+                .optional(),
+              deliverables: z.array(z.string()).optional().describe(DELIVERABLES_DESC),
+              capabilities: z.array(z.string()).optional().describe(CAPABILITIES_DESC),
+              timeout_seconds: z.number().int().positive().optional().describe(TIMEOUT_DESC),
+            }),
+          )
+          .min(1)
+          .max(16)
+          .describe('Independent task specifications (max 16 per call).'),
+      },
+      annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
+    },
+    async ({ tasks }) => {
+      try {
+        return jsonResult(supervisor.spawnTasks(tasks));
+      } catch (err) {
+        return errorResult(err);
+      }
+    },
+  );
+
+  server.registerTool(
+    'get_task_result',
+    {
+      title: 'Get task result (compact)',
+      description:
+        'Retrieve the compact result of a delegated task.\n\n' +
+        'Use this as the default first inspection step after task completion. It intentionally returns condensed status, summary, artifact metadata, deliverables verification, usage, and warnings without flooding Codex context with full logs or large deliverables. Git tasks additionally include the verified commit hash and changed files.\n\n' +
+        'Fetch artifact contents (get_artifact), logs (get_worker_log), or diffs (get_worker_diff) only when the compact result is insufficient for review.',
+      inputSchema: {
+        task_id: z.string().describe(ID_DESC),
+      },
+      annotations: READ_ONLY,
+    },
+    async ({ task_id }) => {
+      try {
+        requireWorkerId(task_id);
+        return jsonResult(supervisor.taskResult(task_id));
+      } catch (err) {
+        return errorResult(err);
+      }
+    },
+  );
+
+  server.registerTool(
+    'list_artifacts',
+    {
+      title: 'List task artifacts',
+      description:
+        'List deliverables produced by a task without loading their contents.\n\n' +
+        'Prefer this before fetching artifacts when you need to understand what a worker produced while keeping context usage low. Returns metadata only: path, mime type, size, sha256.',
+      inputSchema: {
+        task_id: z.string().describe(ID_DESC),
+      },
+      annotations: READ_ONLY,
+    },
+    async ({ task_id }) => {
+      try {
+        requireWorkerId(task_id);
+        return jsonResult({ task_id, artifacts: supervisor.listArtifacts(task_id) });
+      } catch (err) {
+        return errorResult(err);
+      }
+    },
+  );
+
+  server.registerTool(
+    'get_artifact',
+    {
+      title: 'Get artifact content',
+      description:
+        'Read a specific worker deliverable.\n\n' +
+        'Fetch artifacts selectively when their actual contents are necessary for review, synthesis, or final integration. Avoid loading large artifacts merely to inspect whether they exist — use list_artifacts / get_artifact_metadata for that. Content is capped (default 64 KiB) and secret-redacted; binary artifacts return metadata only.',
+      inputSchema: {
+        task_id: z.string().describe(ID_DESC),
+        path: z.string().describe('Artifact path relative to the task workspace, exactly as returned by list_artifacts.'),
+        max_bytes: z.number().int().positive().optional().describe('Max content bytes to return (default 65536, hard cap 1 MiB; larger content is truncated with a marker).'),
+      },
+      annotations: READ_ONLY,
+    },
+    async ({ task_id, path, max_bytes }) => {
+      try {
+        requireWorkerId(task_id);
+        return jsonResult(supervisor.artifactContent(task_id, path, max_bytes));
+      } catch (err) {
+        return errorResult(err);
+      }
+    },
+  );
+
+  server.registerTool(
+    'get_artifact_metadata',
+    {
+      title: 'Get artifact metadata',
+      description:
+        'Metadata only for an artifact (path, mime type, size, sha256, whether the file still exists). Use this for very large files whose content should not enter context.',
+      inputSchema: {
+        task_id: z.string().describe(ID_DESC),
+        path: z.string().describe('Artifact path relative to the task workspace.'),
+      },
+      annotations: READ_ONLY,
+    },
+    async ({ task_id, path }) => {
+      try {
+        requireWorkerId(task_id);
+        return jsonResult(supervisor.artifactMetadata(task_id, path));
+      } catch (err) {
+        return errorResult(err);
+      }
+    },
+  );
+
+  server.registerTool(
+    'get_task_usage',
+    {
+      title: 'Get task usage',
+      description:
+        'Token usage and activity counters for a delegated task: input/output/cache tokens, steps, tool calls grouped by tool, session runs, and duration. Useful for cost awareness and for understanding how a worker spent its effort.',
+      inputSchema: {
+        task_id: z.string().describe(ID_DESC),
+      },
+      annotations: READ_ONLY,
+    },
+    async ({ task_id }) => {
+      try {
+        requireWorkerId(task_id);
+        return jsonResult(supervisor.taskUsage(task_id));
+      } catch (err) {
+        return errorResult(err);
+      }
+    },
+  );
+
+  server.registerTool(
+    'spawn_worker',
+    {
+      title: 'Spawn Kimi code worker (legacy)',
+      description:
+        '[Legacy alias of spawn_task with mode=code and a git_worktree workspace — prefer spawn_task for new work.]\n\n' +
+        'Delegate a substantial coding task to a Kimi K3 worker: it runs in an isolated git worktree on its own branch, explores the repo, implements, and runs/debugs tests autonomously. The workforce supervisor verifies and commits successful changes onto the worker branch automatically. Use for implementation work spanning multiple files or long test/debug trajectories; avoid for tiny one-line edits.\n\n' +
+        'Returns immediately; when the result is needed use wait_task (not get_worker polling), then review get_worker_result / get_worker_diff. The server never merges or pushes — Codex decides whether to accept the branch.',
+      inputSchema: {
+        repo_path: z.string().describe('Absolute path inside the target git repository.'),
+        task: z.string().describe(TASK_DESC),
+        base_ref: z.string().optional().describe('Git ref to branch from (default: current HEAD).'),
+        timeout_seconds: z.number().int().positive().optional().describe(TIMEOUT_DESC),
+      },
+      annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
+    },
+    async ({ repo_path, task, base_ref, timeout_seconds }) => {
+      try {
+        const result = supervisor.spawn({ repo_path, task, base_ref, timeout_seconds });
+        return jsonResult(result);
+      } catch (err) {
+        return errorResult(err);
+      }
+    },
+  );
+
+  server.registerTool(
+    'get_worker',
+    {
+      title: 'Get worker status',
+      description:
+        'Inspect the current state of one delegated task (compact: state, mode, session, branch/workspace, elapsed time, token usage — no logs).\n\n' +
+        'Use for one-off status inspection. Do NOT repeatedly poll this tool while waiting for a worker to finish — prefer wait_task or wait_tasks for efficient waiting.',
+      inputSchema: {
+        worker_id: z.string().describe(ID_DESC),
+      },
+      annotations: READ_ONLY,
+    },
+    async ({ worker_id }) => {
+      try {
+        requireWorkerId(worker_id);
+        return jsonResult(compactStatus(supervisor.get(worker_id)));
+      } catch (err) {
+        return errorResult(err);
+      }
+    },
+  );
+
+  server.registerTool(
+    'list_workers',
+    {
+      title: 'List workers',
+      description:
+        'Get an overview of delegated work (recent tasks, compact status only), optionally filtered by status and/or repo path.\n\n' +
+        'Do not use list_workers as a polling loop while waiting for completion — use wait_task / wait_tasks for that.',
+      inputSchema: {
+        status: z
+          .enum(['queued', 'starting', 'running', 'completed', 'completed_uncommitted', 'failed', 'cancelled', 'interrupted', 'timeout'])
+          .optional()
+          .describe('Only return tasks in this state.'),
+        repo_path: z.string().optional().describe('Only return tasks for this repository (canonicalized path).'),
+        limit: z.number().int().positive().max(100).optional().describe('Max tasks to return (default 20, most recent first).'),
+      },
+      annotations: READ_ONLY,
+    },
+    async ({ status, repo_path, limit }) => {
+      try {
+        const rows = supervisor.list({ status, repo_path, limit });
+        return jsonResult({ workers: rows.map(compactStatus), count: rows.length });
+      } catch (err) {
+        return errorResult(err);
+      }
+    },
+  );
+
+  server.registerTool(
+    'continue_worker',
+    {
+      title: 'Continue worker session',
+      description:
+        'Continue an existing delegated task in the same Kimi/DSH session and the same workspace.\n\n' +
+        'Prefer this when Codex reviews worker output and finds problems, missing requirements, failed tests, or additional closely-related work. For substantial corrections to worker-owned execution, prefer continuing the existing task rather than recreating the work from scratch.\n\n' +
+        'The task must be in a terminal state and have a recorded session; it re-queues and runs again with the follow-up instruction.',
+      inputSchema: {
+        worker_id: z.string().describe(ID_DESC),
+        instruction: z.string().describe('Follow-up instruction, e.g. review feedback to apply. Be specific about what to change; the worker retains full context of its previous work in this session.'),
+      },
+      annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
+    },
+    async ({ worker_id, instruction }) => {
+      try {
+        requireWorkerId(worker_id);
+        const result = await supervisor.continueWorker(worker_id, instruction);
+        return jsonResult(result);
+      } catch (err) {
+        return errorResult(err);
+      }
+    },
+  );
+
+  server.registerTool(
+    'cancel_worker',
+    {
+      title: 'Cancel worker',
+      description:
+        'Terminate a running or queued delegated task (graceful SIGTERM, then SIGKILL after a grace period). The workspace, logs, and any committed/uncommitted changes are preserved — cancellation stops execution, not data.',
+      inputSchema: {
+        worker_id: z.string().describe(ID_DESC),
+      },
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true },
+    },
+    async ({ worker_id }) => {
+      try {
+        requireWorkerId(worker_id);
+        const result = await supervisor.cancelWorker(worker_id);
+        return jsonResult(result);
+      } catch (err) {
+        return errorResult(err);
+      }
+    },
+  );
+
+  server.registerTool(
+    'get_worker_result',
+    {
+      title: 'Get worker result (legacy, git-focused)',
+      description:
+        'Legacy compact result for code workers (equivalent git-verified facts also appear in get_task_result).\n\n' +
+        'Use as the default first inspection step after a coding task completes: condensed summary, verified changed files, commit hash, reported tests, usage — never thinking, transcripts, or large diffs. For non-code tasks or artifact-centric results, prefer get_task_result.',
+      inputSchema: {
+        worker_id: z.string().describe(ID_DESC),
+      },
+      annotations: READ_ONLY,
+    },
+    async ({ worker_id }) => {
+      try {
+        requireWorkerId(worker_id);
+        return jsonResult(supervisor.result(worker_id));
+      } catch (err) {
+        return errorResult(err);
+      }
+    },
+  );
+
+  server.registerTool(
+    'get_worker_log',
+    {
+      title: 'Get worker log tail',
+      description:
+        'Inspect recent worker execution logs for diagnosis.\n\n' +
+        'Use primarily when a task failed, stalled, or its compact result does not explain an issue. Do not fetch logs routinely after successful tasks. Returns a redacted, size-capped, human-readable tail of the event stream.',
+      inputSchema: {
+        worker_id: z.string().describe(ID_DESC),
+        tail_lines: z.number().int().positive().max(1000).optional().describe('Number of trailing log lines (default 100, output capped at 32 KiB total).'),
+      },
+      annotations: READ_ONLY,
+    },
+    async ({ worker_id, tail_lines }) => {
+      try {
+        requireWorkerId(worker_id);
+        return jsonResult(supervisor.log(worker_id, tail_lines ?? 100));
+      } catch (err) {
+        return errorResult(err);
+      }
+    },
+  );
+
+  server.registerTool(
+    'get_worker_diff',
+    {
+      title: 'Get worker diff',
+      description:
+        'Inspect delegated code changes (git tasks only).\n\n' +
+        'Start with the default diff statistics, or focus on specific paths with the path parameter; request the full diff (stat_only=false) only when review requires it. Use this during review before accepting worker-generated code. Avoid loading unnecessarily large diffs into context — full diffs are size-capped and redacted.',
+      inputSchema: {
+        worker_id: z.string().describe(ID_DESC),
+        stat_only: z.boolean().optional().describe('Default true: return only diff --stat. Set false for the full patch (size-capped).'),
+        path: z.string().optional().describe('Restrict the diff to one relative path inside the repo.'),
+      },
+      annotations: READ_ONLY,
+    },
+    async ({ worker_id, stat_only, path }) => {
+      try {
+        requireWorkerId(worker_id);
+        return jsonResult(supervisor.diff(worker_id, { stat_only, path }));
+      } catch (err) {
+        return errorResult(err);
+      }
+    },
+  );
+
+  return server;
+}
+
+export async function serveStdio(supervisor: WorkerSupervisor): Promise<void> {
+  const server = createMcpServer(supervisor);
+  const transport = new StdioServerTransport();
+  await server.connect(transport);
+  // Keep the process alive; stderr is safe for diagnostics on stdio transport.
+  process.stderr.write('kimi-worker-mcp: MCP server listening on stdio\n');
+}

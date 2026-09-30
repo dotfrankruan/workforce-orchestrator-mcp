@@ -1,0 +1,35 @@
+{
+  "name": "kimi-workforce-mcp",
+  "version": "0.2.0",
+  "description": "MCP server that lets Codex delegate coding/research/data/docs/file/ops/review tasks to DeepSeek Harness (Kimi) workers",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "kimi-worker-mcp": "./dist/cli.js",
+    "kimi-workforce-mcp": "./dist/cli.js"
+  },
+  "main": "./dist/index.js",
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "npm run build && node --test \"dist/test/**/*.test.js\"",
+    "test:unit": "npm run build && node --test \"dist/test/unit/*.test.js\"",
+    "test:integration": "npm run build && node --test \"dist/test/integration/*.test.js\"",
+    "serve": "node dist/cli.js serve",
+    "smoke": "node scripts/mcp-smoke.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.18.0",
+    "zod": "^4.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.8.3"
+  }
+}
