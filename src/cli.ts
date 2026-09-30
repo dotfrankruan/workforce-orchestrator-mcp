@@ -28,6 +28,82 @@ function printJson(data: unknown): void {
   process.stdout.write(JSON.stringify(data, null, 2) + '\n');
 }
 
+const WF_STATUS_ICON: Record<string, string> = {
+  completed: '✓',
+  completed_uncommitted: '✓',
+  running: '●',
+  starting: '●',
+  queued: '○',
+  waiting_dependencies: '○',
+  failed: '✗',
+  timeout: '✗',
+  budget_exceeded: '✗',
+  interrupted: '✗',
+  cancelled: '⊘',
+  blocked: '⊘',
+};
+
+/** Simple ASCII rendering of a workflow DAG. */
+function renderWorkflowAscii(overview: Record<string, unknown>): string {
+  const tasks = (overview['tasks'] ?? []) as Array<Record<string, unknown>>;
+  const lines: string[] = [
+    `workflow ${overview['workflow_id']}  [${overview['status']}]${overview['name'] ? `  ${overview['name']}` : ''}`,
+  ];
+  if (tasks.length === 0) return lines.join('\n');
+
+  interface Node {
+    key: string;
+    status: string;
+    role: string | null;
+    depends_on: string[];
+  }
+  const nodes: Node[] = tasks.map((t) => ({
+    key: String(t['key']),
+    status: String(t['status']),
+    role: (t['role'] as string | null) ?? null,
+    depends_on: (t['depends_on'] as string[]) ?? [],
+  }));
+  const byKey = new Map(nodes.map((n) => [n.key, n]));
+  const children = new Map<string, string[]>();
+  const roots: string[] = [];
+  for (const n of nodes) {
+    const parents = n.depends_on.filter((d) => byKey.has(d));
+    if (parents.length === 0) roots.push(n.key);
+    for (const p of parents) {
+      const arr = children.get(p) ?? [];
+      arr.push(n.key);
+      children.set(p, arr);
+    }
+  }
+  const printed = new Set<string>();
+  const render = (key: string, prefix: string, connector: string) => {
+    if (printed.has(key)) {
+      lines.push(`${prefix}${connector}(↳ ${key} — see above)`);
+      return;
+    }
+    printed.add(key);
+    const n = byKey.get(key)!;
+    const icon = WF_STATUS_ICON[n.status] ?? '?';
+    lines.push(`${prefix}${connector}${n.key} ${icon}${n.role ? ` (${n.role})` : ''}  [${n.status}]`);
+    const kids = children.get(key) ?? [];
+    kids.forEach((child, i) => {
+      const last = i === kids.length - 1;
+      render(child, prefix + (connector === '' ? '' : last ? '    ' : '│   '), (kids.length > 1 || connector === '') ? (last ? '└── ' : '├── ') : last ? '└── ' : '├── ');
+    });
+  };
+  roots.forEach((root, i) => {
+    render(root, '', i === roots.length - 1 && roots.length > 1 ? '' : '');
+  });
+  // Orphans (defensive; shouldn't happen with validated DAGs).
+  for (const n of nodes) {
+    if (!printed.has(n.key)) {
+      const icon = WF_STATUS_ICON[n.status] ?? '?';
+      lines.push(`${n.key} ${icon}  [${n.status}]`);
+    }
+  }
+  return lines.join('\n');
+}
+
 function usage(): never {
   process.stderr.write(
     `kimi-worker-mcp — delegate engineering tasks to Kimi workers via DeepSeek Harness
@@ -158,6 +234,52 @@ async function main(): Promise<void> {
       if (!id) usage();
       const { supervisor, store } = openSupervisor();
       printJson(supervisor.taskUsage(id));
+      store.close();
+      break;
+    }
+
+    case 'workflows': {
+      const { supervisor, store } = openSupervisor();
+      const wfs = supervisor.listWorkflows(argValue(rest, '--limit') ? Number(argValue(rest, '--limit')) : 20);
+      printJson(
+        wfs.map((w) => ({
+          workflow_id: w['workflow_id'],
+          name: w['name'],
+          status: w['status'],
+          preset: w['preset'],
+          progress: w['progress'],
+          created_at: w['created_at'],
+        })),
+      );
+      store.close();
+      break;
+    }
+
+    case 'workflow': {
+      const id = rest[0];
+      if (!id) usage();
+      const { supervisor, store } = openSupervisor();
+      process.stdout.write(renderWorkflowAscii(supervisor.getWorkflow(id)) + '\n');
+      store.close();
+      break;
+    }
+
+    case 'workflow-wait': {
+      const id = rest[0];
+      if (!id) usage();
+      const { supervisor, store } = openSupervisor();
+      supervisor.init();
+      const timeout = argValue(rest, '--timeout');
+      printJson(await supervisor.waitWorkflow(id, timeout ? Number(timeout) : undefined));
+      store.close();
+      break;
+    }
+
+    case 'workflow-cancel': {
+      const id = rest[0];
+      if (!id) usage();
+      const { supervisor, store } = openSupervisor();
+      printJson(await supervisor.cancelWorkflow(id));
       store.close();
       break;
     }

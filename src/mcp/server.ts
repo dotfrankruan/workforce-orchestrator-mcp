@@ -221,6 +221,170 @@ export function createMcpServer(supervisor: WorkerSupervisor): McpServer {
   );
 
   server.registerTool(
+    'create_workflow',
+    {
+      title: 'Create workflow (task DAG)',
+      description:
+        'Create a multi-task workflow: a dependency DAG of Kimi tasks sharing one workspace. Dependencies reference per-task keys (not ids); cycles are rejected. Tasks without dependencies start immediately (parallel), dependents start automatically when their dependencies complete (all_success) or terminate (all_terminal).\n\n' +
+        'Use for multi-track delegated work: research → implement → test → review pipelines, parallel analysis with a synthesis step, etc. Then wait_workflow / get_workflow_result.\n\n' +
+        'failure_policy: stop_dependents (default; downstream of a failed task is blocked) | continue (independent branches proceed; all_terminal dependents still run) | cancel_remaining.',
+      inputSchema: {
+        name: z.string().optional(),
+        tasks: z
+          .array(
+            z.object({
+              key: z.string().describe('Per-workflow task key ([a-zA-Z0-9_-], referenced by depends_on).'),
+              task: z.string().describe(TASK_DESC),
+              mode: z.enum(['code', 'research', 'data', 'docs', 'file', 'ops', 'review', 'general']).optional().describe(MODE_DESC),
+              role: z.string().optional().describe('Built-in role template name (see list_roles) — shapes the worker prompt.'),
+              depends_on: z.array(z.string()).optional().describe('Keys of tasks in this workflow that must finish first.'),
+              dependency_policy: z.enum(['all_success', 'all_terminal']).optional().describe('all_success (default): every dependency must complete successfully. all_terminal: dependencies just need to be terminal (even failed).'),
+              deliverables: z.array(z.string()).optional().describe(DELIVERABLES_DESC),
+              capabilities: z.array(z.string()).optional().describe(CAPABILITIES_DESC),
+              priority: z.enum(['low', 'normal', 'high']).optional(),
+              timeout_seconds: z.number().int().positive().optional().describe(TIMEOUT_DESC),
+              budget: z
+                .object({
+                  max_duration_seconds: z.number().int().positive().optional(),
+                  max_input_tokens: z.number().int().positive().optional(),
+                  max_output_tokens: z.number().int().positive().optional(),
+                  max_total_tokens: z.number().int().positive().optional().describe('input+output+cache_read, checked per DSH status event (best-effort, not hard accounting)'),
+                  max_tool_calls: z.number().int().positive().optional(),
+                  max_iterations: z.number().int().positive().optional(),
+                })
+                .optional(),
+              retry: z
+                .object({
+                  max_attempts: z.number().int().min(1).max(5),
+                  retry_on: z.array(z.enum(['failed', 'timeout'])).optional(),
+                })
+                .optional(),
+            }),
+          )
+          .min(1)
+          .max(32),
+        workspace: z
+          .object({
+            type: z.enum(['git_worktree', 'directory', 'temporary']).optional(),
+            path: z.string().optional(),
+            repo_path: z.string().optional(),
+            base_ref: z.string().optional(),
+          })
+          .optional()
+          .describe('Shared workspace for ALL tasks in the workflow (default: temporary; git_worktree when repo_path given — one shared branch, supervisor commits per task).'),
+        budget: z
+          .object({
+            max_duration_seconds: z.number().int().positive().optional(),
+            max_kimi_tokens: z.number().int().positive().optional().describe('Sum of input+output+cache_read tokens across all workflow tasks (best-effort).'),
+            max_concurrent_tasks: z.number().int().positive().optional(),
+            max_tasks: z.number().int().positive().optional(),
+          })
+          .optional(),
+        failure_policy: z.enum(['continue', 'stop_dependents', 'cancel_remaining']).optional(),
+        metadata: z.record(z.string(), z.unknown()).optional(),
+      },
+      annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
+    },
+    async (args) => {
+      try {
+        return jsonResult(supervisor.createWorkflow(args as Parameters<typeof supervisor.createWorkflow>[0]));
+      } catch (err) {
+        return errorResult(err);
+      }
+    },
+  );
+
+  server.registerTool(
+    'get_workflow',
+    {
+      title: 'Get workflow',
+      description: 'Full workflow overview incl. the task graph (keys, dependencies, roles, modes, per-task status) — the plan is always transparent, never opaque.',
+      inputSchema: { workflow_id: z.string() },
+      annotations: READ_ONLY,
+    },
+    async ({ workflow_id }) => {
+      try {
+        return jsonResult(supervisor.getWorkflow(workflow_id));
+      } catch (err) {
+        return errorResult(err);
+      }
+    },
+  );
+
+  server.registerTool(
+    'list_workflows',
+    {
+      title: 'List workflows',
+      description: 'List recent workflows with per-task status summaries. For waiting on a specific workflow, use wait_workflow instead of polling this.',
+      inputSchema: { limit: z.number().int().positive().max(100).optional() },
+      annotations: READ_ONLY,
+    },
+    async ({ limit }) => {
+      try {
+        return jsonResult({ workflows: supervisor.listWorkflows(limit) });
+      } catch (err) {
+        return errorResult(err);
+      }
+    },
+  );
+
+  server.registerTool(
+    'wait_workflow',
+    {
+      title: 'Wait for workflow (efficient)',
+      description:
+        'Efficiently wait for a workflow to reach a terminal state (completed / completed_with_failures / failed / cancelled). Event-driven — returns as soon as all tasks are terminal. A wait timeout does not cancel the workflow or its tasks.',
+      inputSchema: {
+        workflow_id: z.string(),
+        timeout_seconds: z.number().int().min(1).max(600).optional().describe('Wait budget in seconds (default 120, max 600). Not the workflow execution timeout.'),
+      },
+      annotations: READ_ONLY,
+    },
+    async ({ workflow_id, timeout_seconds }) => {
+      try {
+        return jsonResult(await supervisor.waitWorkflow(workflow_id, timeout_seconds));
+      } catch (err) {
+        return errorResult(err);
+      }
+    },
+  );
+
+  server.registerTool(
+    'cancel_workflow',
+    {
+      title: 'Cancel workflow',
+      description: 'Cancel a running workflow: all non-terminal tasks are cancelled (running tasks get graceful termination). Workspaces, branches and artifacts are preserved.',
+      inputSchema: { workflow_id: z.string() },
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true },
+    },
+    async ({ workflow_id }) => {
+      try {
+        return jsonResult(await supervisor.cancelWorkflow(workflow_id));
+      } catch (err) {
+        return errorResult(err);
+      }
+    },
+  );
+
+  server.registerTool(
+    'get_workflow_result',
+    {
+      title: 'Get workflow result (compact)',
+      description:
+        'Compact structured synthesis of a workflow: status, per-task outcomes, aggregated artifact metadata, aggregate metrics (duration, tokens, attempts), git branch state, and warnings. No LLM summarization — Codex performs the final review and synthesis.',
+      inputSchema: { workflow_id: z.string() },
+      annotations: READ_ONLY,
+    },
+    async ({ workflow_id }) => {
+      try {
+        return jsonResult(supervisor.workflowResult(workflow_id));
+      } catch (err) {
+        return errorResult(err);
+      }
+    },
+  );
+
+  server.registerTool(
     'get_task_result',
     {
       title: 'Get task result (compact)',
