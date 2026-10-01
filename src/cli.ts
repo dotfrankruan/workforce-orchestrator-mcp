@@ -3,9 +3,9 @@ import fs from 'node:fs';
 import { loadConfig, ensureConfigDirs, type Config } from './config.js';
 import { WorkerStore } from './db.js';
 import { WorkerSupervisor, elapsedSeconds } from './supervisor.js';
-import { DshBackend } from './backend/dsh.js';
-import { FakeBackend, FakeScenarios } from './backend/fake.js';
-import type { WorkerBackend } from './backend/types.js';
+import { DshBackend } from './backends/dsh.js';
+import { FakeBackend, FakeScenarios } from './backends/fake.js';
+import type { WorkerBackend } from './backends/types.js';
 import { serveStdio } from './mcp/server.js';
 
 function buildBackend(config: Config): WorkerBackend {

@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { FakeScenarios, type FakeScenario } from '../../backend/fake.js';
+import { FakeScenarios, type FakeScenario } from '../../backends/fake.js';
 import { makeHarness } from '../helpers.js';
 
 const bigUsage = (inputTokens: number): FakeScenario => ({

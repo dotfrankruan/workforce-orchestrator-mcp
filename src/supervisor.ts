@@ -64,7 +64,8 @@ import {
   isProbablyBinary,
   type CollectedFile,
 } from './artifacts.js';
-import type { WorkerBackend, WorkerBackendHandle } from './backend/types.js';
+import type { WorkerBackend, WorkerBackendHandle } from './backends/types.js';
+import { BackendRegistry } from './backends/registry.js';
 import { getRole, BUILT_IN_ROLES } from './roles.js';
 import { getPreset, presetNames, WORKFLOW_PRESETS } from './presets.js';
 import {
@@ -111,6 +112,8 @@ export interface SpawnTaskParams {
   execution_class?: string | undefined;
   budget?: TaskBudget | undefined;
   retry?: { max_attempts: number; retry_on?: string[] } | undefined;
+  /** Explicit runtime backend id (see list_backends). Default: router → dsh. */
+  backend?: string | undefined;
 }
 
 export interface SpawnTaskResult {
@@ -121,6 +124,7 @@ export interface SpawnTaskResult {
   branch: string | null;
   session_id: string | null;
   queued: boolean;
+  backend: string;
   cache?: { hit: boolean; source_task_id?: string; age_seconds?: number; artifacts_reused?: number; artifact_bytes?: number } | undefined;
 }
 
@@ -238,11 +242,22 @@ export class WorkerSupervisor {
    */
   private waiters = new Map<string, Set<() => void>>();
 
+  private registry: BackendRegistry;
+
   constructor(
     private config: Config,
     private store: WorkerStore,
-    private backend: WorkerBackend,
-  ) {}
+    backend: WorkerBackend | BackendRegistry,
+  ) {
+    this.registry = backend instanceof BackendRegistry ? backend : new BackendRegistry(backend);
+  }
+
+  /** The backend assigned to a task row (tolerant: unknown/legacy ids fall
+   * back to the registry default so old rows keep working). */
+  private backendFor(row: WorkerRow): WorkerBackend {
+    const id = row.backend_id || this.registry.defaultBackendId;
+    return this.registry.has(id) ? this.registry.get(id) : this.registry.get(this.registry.defaultBackendId);
+  }
 
   /** Startup reconciliation: reattach live workers, finalize finished ones,
    *  mark only genuinely-vanished workers interrupted. */
@@ -296,7 +311,7 @@ export class WorkerSupervisor {
     const stdoutPath = path.join(row.log_dir, 'stdout.jsonl');
     const replay = replayLogFile(stdoutPath);
 
-    const marker = this.backend.processMarker ?? path.basename(this.config.dshBin);
+    const marker = this.backendFor(row).processMarker ?? path.basename(this.config.dshBin);
     const alive = isExpectedWorkerProcess(row.pid, row.pid_identity, marker);
 
     if (alive) {
@@ -653,6 +668,11 @@ export class WorkerSupervisor {
     }
     const retryOn = params.retry?.retry_on ?? ['failed', 'timeout'];
 
+    // Backend routing: explicit task choice > role rule > config default > dsh.
+    // Availability is verified here (local check only, no API calls). There
+    // is deliberately NO automatic fallback to another backend.
+    const backend = this.registry.resolveAvailable({ backend: params.backend, role: params.role ?? null });
+
     // Unique worker id (collision-proof against the db).
     let id = newWorkerId();
     while (this.store.getWorker(id) !== null) id = newWorkerId();
@@ -722,6 +742,8 @@ export class WorkerSupervisor {
       max_attempts: maxAttempts,
       retry_on: JSON.stringify(retryOn),
       initialStatus: dependsOn.length > 0 ? 'waiting_dependencies' : 'queued',
+      backend_id: backend.id,
+      backend_metadata: JSON.stringify(backend.metadata?.() ?? {}),
     });
     if (taskBranch || integrationStatus) {
       this.store.updateWorker(id, {
@@ -819,6 +841,7 @@ export class WorkerSupervisor {
       branch: plan.branch || null,
       session_id: row.session_id,
       queued: row.status === 'queued',
+      backend: backend.id,
       ...(cacheInfo ? { cache: cacheInfo } : {}),
     };
   }
@@ -2009,7 +2032,8 @@ export class WorkerSupervisor {
     const runRef: { current: ActiveRun | null } = { current: null };
 
     try {
-      handle = this.backend.start(
+      const backend = this.backendFor(row);
+      handle = backend.start(
         {
           workerId: row.id,
           cwd: row.worktree_path,
@@ -2025,9 +2049,10 @@ export class WorkerSupervisor {
             this.store.addEvent(row.id, 'spawn_error', redactSecrets(err.message).slice(0, MAX_EVENT_SUMMARY));
           },
           onExit: (code, signal) => {
+            if (this.shutDown) return; // detached: worker state stays in the db
             const run0 = runRef.current;
             if (run0?.tailTimer) clearTimeout(run0.tailTimer);
-            if (run0 && this.backend.durableStdout) {
+            if (run0 && this.backendFor(this.get(row.id)).durableStdout) {
               // Final drain of the durable log before finalizing (the tailer
               // may lag a few hundred ms behind the process).
               try {
@@ -2080,7 +2105,7 @@ export class WorkerSupervisor {
     runRef.current = run;
     this.active.set(row.id, run);
 
-    if (this.backend.durableStdout) {
+    if (this.backendFor(row).durableStdout) {
       // Events flow exclusively through the durable log tailer.
       run.tailOffset = (() => {
         try {
@@ -2859,7 +2884,9 @@ export class WorkerSupervisor {
       status: row.status,
       acceptance: row.acceptance,
       role: row.role,
+      backend: row.backend_id,
       session_id: row.session_id,
+      backend_session_id: row.session_id,
       workspace: { type: row.workspace_type, path: row.worktree_path },
       summary: summary.summary,
       artifacts,
@@ -3103,7 +3130,7 @@ export class WorkerSupervisor {
   /** Process diagnostics for CLI inspect / debugging. */
   processDiagnostics(workerId: string): Record<string, unknown> {
     const row = this.get(workerId);
-    const marker = this.backend.processMarker ?? path.basename(this.config.dshBin);
+    const marker = this.backendFor(row).processMarker ?? path.basename(this.config.dshBin);
     const alive = row.pid ? pidAlive(row.pid) : false;
     const identityOk = row.pid ? isExpectedWorkerProcess(row.pid, row.pid_identity, marker) : false;
     let lastEventAt: string | null = null;

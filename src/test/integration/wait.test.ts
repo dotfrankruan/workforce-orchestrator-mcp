@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { FakeScenarios, type FakeScenario } from '../../backend/fake.js';
+import { FakeScenarios, type FakeScenario } from '../../backends/fake.js';
 import { makeTempRepo, makeHarness, removeDir } from '../helpers.js';
 
 const quick = (text = 'done'): FakeScenario => ({

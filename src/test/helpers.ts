@@ -5,7 +5,7 @@ import { execFileSync } from 'node:child_process';
 import { loadConfig, ensureConfigDirs, type Config } from '../config.js';
 import { WorkerStore } from '../db.js';
 import { WorkerSupervisor } from '../supervisor.js';
-import { FakeBackend, type FakeScenario } from '../backend/fake.js';
+import { FakeBackend, type FakeScenario } from '../backends/fake.js';
 
 export function makeTempDir(prefix: string): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -124,7 +124,7 @@ import type {
   WorkerBackendHandle,
   BackendStartOptions,
   BackendEvents,
-} from '../backend/types.js';
+} from '../backends/types.js';
 import { parseDshLine } from '../parser.js';
 
 export interface ProcStep {
@@ -142,7 +142,21 @@ const CHILD_MARKER = 'kimi-worker-proc-script';
  */
 export class ProcScriptBackend implements WorkerBackend {
   readonly name = 'procscript';
+  readonly id = 'procscript';
+  readonly displayName = 'ProcScriptBackend';
+  readonly capabilities = {
+    continuation: true,
+    durableReattach: true,
+    structuredEvents: true,
+    usageReporting: true,
+    toolCallEvents: true,
+    artifacts: true,
+  } as const;
   readonly processMarker = CHILD_MARKER;
+
+  isAvailable(): boolean {
+    return true;
+  }
 
   constructor(private scenario: (info: { workerId: string; resume: boolean }) => { steps: ProcStep[]; exitCode?: number }) {}
 

@@ -6,7 +6,7 @@ import { createMcpServer, SERVER_INSTRUCTIONS } from '../../mcp/server.js';
 import { loadConfig } from '../../config.js';
 import { WorkerStore } from '../../db.js';
 import { WorkerSupervisor } from '../../supervisor.js';
-import { FakeBackend, FakeScenarios } from '../../backend/fake.js';
+import { FakeBackend, FakeScenarios } from '../../backends/fake.js';
 import { makeTempDir, removeDir } from '../helpers.js';
 
 async function connectClient(): Promise<{ client: Client; cleanup: () => Promise<void> }> {

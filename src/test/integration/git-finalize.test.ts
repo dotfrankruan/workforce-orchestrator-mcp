@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { FakeScenarios, type FakeScenario } from '../../backend/fake.js';
+import { FakeScenarios, type FakeScenario } from '../../backends/fake.js';
 import { makeTempRepo, makeHarness, git, removeDir } from '../helpers.js';
 
 const COMMIT_ENV_ARGS = ['-c', 'user.name=kimi-worker', '-c', 'user.email=kimi-worker@localhost', '-c', 'commit.gpgsign=false'];

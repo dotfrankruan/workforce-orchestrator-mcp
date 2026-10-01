@@ -1,6 +1,6 @@
-import { spawn, type ChildProcess } from 'node:child_process';
+import { spawn, execFileSync, type ChildProcess } from 'node:child_process';
 import fs from 'node:fs';
-import type { WorkerBackend, WorkerBackendHandle, BackendStartOptions, BackendEvents } from './types.js';
+import type { WorkerBackend, WorkerBackendHandle, BackendStartOptions, BackendEvents, BackendMetadata } from './types.js';
 
 export interface DshBackendOptions {
   dshBin: string;
@@ -24,13 +24,56 @@ export interface DshBackendOptions {
  * left to dsh itself (~/.dsh/.env); this process never reads or forwards them.
  */
 export class DshBackend implements WorkerBackend {
-  readonly name = 'dsh';
+  readonly id = 'dsh';
+  readonly displayName = 'DeepSeek Harness';
+  readonly capabilities = {
+    continuation: true,
+    durableReattach: true,
+    structuredEvents: true,
+    usageReporting: true,
+    toolCallEvents: true,
+    artifacts: true,
+  } as const;
   /** Marker expected in the worker process command line (reattach identity). */
   readonly processMarker = 'dsh';
   /** stdout/stderr go straight to files; the supervisor tails them. */
   readonly durableStdout = true;
 
   constructor(private opts: DshBackendOptions) {}
+
+  /** Local availability only: executable exists and is runnable. No API calls. */
+  isAvailable(): boolean {
+    try {
+      fs.accessSync(this.opts.dshBin, fs.constants.X_OK);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /** Runtime facts known locally; provider/model intentionally null (never guessed). */
+  metadata(): BackendMetadata {
+    return {
+      runtime: { name: 'DeepSeek Harness', version: this.version() ?? undefined },
+      provider: { name: undefined, model: undefined },
+    };
+  }
+
+  private versionCache: string | null | undefined;
+  private version(): string | null {
+    if (this.versionCache !== undefined) return this.versionCache;
+    try {
+      const out = execFileSync(this.opts.dshBin, ['--version'], {
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+        timeout: 5000,
+      }).trim();
+      this.versionCache = out || null;
+    } catch {
+      this.versionCache = null;
+    }
+    return this.versionCache;
+  }
 
   start(opts: BackendStartOptions, events: BackendEvents): WorkerBackendHandle {
     const args = ['--profile', this.opts.profile, '--json'];

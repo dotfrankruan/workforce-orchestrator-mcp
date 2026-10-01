@@ -115,6 +115,9 @@ export interface WorkerRow {
   supervision_state: string; // attached | reattached | detached
   stdout_parse_offset: number; // bytes of stdout.jsonl already parsed
   pid_identity: string | null; // process start token (ps lstart) at spawn
+  // v6: universal backend
+  backend_id: string; // runtime backend that executes the task (default dsh)
+  backend_metadata: string | null; // JSON {runtime:{...}, provider:{...}} — facts only
 }
 
 export interface WorkflowRow {
@@ -205,6 +208,7 @@ export interface WorkerPatch {
   supervision_state?: string;
   stdout_parse_offset?: number;
   pid_identity?: string | null;
+  backend_metadata?: string | null;
 }
 
 export interface NewWorker {
@@ -233,6 +237,8 @@ export interface NewWorker {
   max_attempts?: number;
   retry_on?: string;
   initialStatus?: WorkerStatus;
+  backend_id?: string;
+  backend_metadata?: string | null;
 }
 
 export interface NewWorkflow {
@@ -453,7 +459,14 @@ const WORKERS_V5_COLUMNS: Array<[string, string]> = [
   ['pid_identity', `ALTER TABLE workers ADD COLUMN pid_identity TEXT`],
 ];
 
-const CURRENT_SCHEMA_VERSION = 5;
+/** Columns added in schema v6 (universal backend architecture). */
+const WORKERS_V6_COLUMNS: Array<[string, string]> = [
+  // All pre-existing rows were executed by the dsh backend — a safe fact.
+  ['backend_id', `ALTER TABLE workers ADD COLUMN backend_id TEXT NOT NULL DEFAULT 'dsh'`],
+  ['backend_metadata', `ALTER TABLE workers ADD COLUMN backend_metadata TEXT`],
+];
+
+const CURRENT_SCHEMA_VERSION = 6;
 
 const ALL_COLUMNS = [
   'id', 'repo_path', 'base_ref', 'branch', 'worktree_path', 'log_dir', 'status', 'task',
@@ -467,6 +480,7 @@ const ALL_COLUMNS = [
   'task_branch', 'workspace_base_commit', 'task_commits', 'integration_status',
   'integration_error', 'integrated_commits',
   'run_started_at', 'supervision_state', 'stdout_parse_offset', 'pid_identity',
+  'backend_id', 'backend_metadata',
 ] as const;
 
 function rowToWorker(row: Record<string, unknown>): WorkerRow {
@@ -552,6 +566,13 @@ function migrate(db: DatabaseSync): void {
     version = 5;
   }
 
+  if (version < 6) {
+    for (const [col, ddl] of WORKERS_V6_COLUMNS) {
+      if (!columnExists(db, 'workers', col)) db.exec(ddl);
+    }
+    version = 6;
+  }
+
   db.exec(`CREATE TABLE IF NOT EXISTS schema_meta (id INTEGER PRIMARY KEY CHECK (id = 1), version INTEGER NOT NULL)`);
   db.prepare(
     `INSERT INTO schema_meta (id, version) VALUES (1, ?)
@@ -588,8 +609,9 @@ export class WorkerStore {
     this.db
       .prepare(
         `INSERT INTO workers (id, repo_path, base_ref, branch, worktree_path, log_dir, status, task, mode, workspace_type, deliverables, capabilities, created_at, updated_at, timeout_seconds,
-           workflow_id, task_key, depends_on, dependency_policy, role, priority, cache_policy, execution_class, budget, max_attempts, retry_on)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           workflow_id, task_key, depends_on, dependency_policy, role, priority, cache_policy, execution_class, budget, max_attempts, retry_on,
+           backend_id, backend_metadata)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         w.id, w.repo_path, w.base_ref, w.branch, w.worktree_path, w.log_dir,
@@ -599,6 +621,7 @@ export class WorkerStore {
         w.dependency_policy ?? 'all_success', w.role ?? null, w.priority ?? 'normal',
         w.cache_policy ?? 'off', w.execution_class ?? null, w.budget ?? null,
         w.max_attempts ?? 1, w.retry_on ?? '["failed","timeout"]',
+        w.backend_id ?? 'dsh', w.backend_metadata ?? null,
       );
     return this.getWorker(w.id)!;
   }

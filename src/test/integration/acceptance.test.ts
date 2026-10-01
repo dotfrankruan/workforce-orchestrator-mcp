@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { FakeScenarios } from '../../backend/fake.js';
+import { FakeScenarios } from '../../backends/fake.js';
 import { makeHarness } from '../helpers.js';
 
 const ok = (tag: string) => ({

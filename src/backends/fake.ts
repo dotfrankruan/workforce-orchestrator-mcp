@@ -39,9 +39,28 @@ function stepToLine(step: FakeStep): string | null {
 }
 
 export class FakeBackend implements WorkerBackend {
-  readonly name = 'fake';
+  readonly id: string;
+  readonly displayName: string;
+  readonly capabilities = {
+    continuation: true,
+    durableReattach: false,
+    structuredEvents: true,
+    usageReporting: true,
+    toolCallEvents: true,
+    artifacts: true,
+  } as const;
 
-  constructor(private options: FakeBackendOptions) {}
+  constructor(
+    private options: FakeBackendOptions,
+    id = 'fake',
+  ) {
+    this.id = id;
+    this.displayName = `FakeBackend(${id})`;
+  }
+
+  isAvailable(): boolean {
+    return true;
+  }
 
   start(opts: BackendStartOptions, events: BackendEvents): WorkerBackendHandle {
     const scenario = this.options.scenario({

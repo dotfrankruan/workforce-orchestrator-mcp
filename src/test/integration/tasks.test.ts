@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import type { FakeScenario } from '../../backend/fake.js';
+import type { FakeScenario } from '../../backends/fake.js';
 import { makeTempRepo, makeHarness, makeTempDir, git, removeDir } from '../helpers.js';
 
 /** Scenario: write research-style deliverables into the workspace. */
@@ -288,7 +288,7 @@ test('invalid spawn_task inputs are rejected', () => {
 
 test('legacy spawn_worker maps to code + git_worktree with mode recorded', async () => {
   const repo = makeTempRepo();
-  const { FakeScenarios } = await import('../../backend/fake.js');
+  const { FakeScenarios } = await import('../../backends/fake.js');
   const h = makeHarness(() => FakeScenarios.successWithCommit('feat.txt', 'f\n', 'feat'));
   try {
     const spawn = h.supervisor.spawn({ repo_path: repo, task: 'legacy spawn' });

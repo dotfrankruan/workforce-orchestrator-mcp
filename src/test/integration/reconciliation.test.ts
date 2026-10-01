@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { WorkerStore } from '../../db.js';
 import { WorkerSupervisor } from '../../supervisor.js';
-import { FakeBackend, FakeScenarios } from '../../backend/fake.js';
+import { FakeBackend, FakeScenarios } from '../../backends/fake.js';
 import { loadConfig, ensureConfigDirs } from '../../config.js';
 import { makeTempRepo, makeHarness, makeTempDir, git, removeDir } from '../helpers.js';
 

@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import type { FakeScenario } from '../../backend/fake.js';
+import type { FakeScenario } from '../../backends/fake.js';
 import { computeCacheKey, workspaceFingerprint, normalizeTaskText, CACHE_SCHEMA_VERSION } from '../../cache.js';
 import { makeTempRepo, makeTempDir, makeHarness, git, removeDir } from '../helpers.js';
 

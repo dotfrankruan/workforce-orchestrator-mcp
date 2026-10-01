@@ -24,9 +24,9 @@ export {
   resolveUnderRoot,
   walkArtifacts,
 } from './artifacts.js';
-export { DshBackend } from './backend/dsh.js';
-export { FakeBackend, FakeScenarios, type FakeScenario, type FakeStep } from './backend/fake.js';
-export type { WorkerBackend } from './backend/types.js';
+export { DshBackend } from './backends/dsh.js';
+export { FakeBackend, FakeScenarios, type FakeScenario, type FakeStep } from './backends/fake.js';
+export type { WorkerBackend } from './backends/types.js';
 export { createMcpServer, serveStdio } from './mcp/server.js';
 export { parseDshLine, UsageTracker, summarizeFinalText, renderLogLine, replayLogFile } from './parser.js';
 export { redactSecrets } from './util/redact.js';

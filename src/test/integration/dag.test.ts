@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { FakeScenarios, type FakeScenario } from '../../backend/fake.js';
+import { FakeScenarios, type FakeScenario } from '../../backends/fake.js';
 import { WorkerSupervisor } from '../../supervisor.js';
 import { makeTempRepo, makeHarness, git, removeDir } from '../helpers.js';
 
