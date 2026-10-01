@@ -65,6 +65,8 @@ import {
   type CollectedFile,
 } from './artifacts.js';
 import type { WorkerBackend, WorkerBackendHandle } from './backends/types.js';
+import type { WorkerEvent } from './backends/events.js';
+import { normalizeDshEvent } from './backends/events.js';
 import { BackendRegistry } from './backends/registry.js';
 import { getRole, BUILT_IN_ROLES } from './roles.js';
 import { getPreset, presetNames, WORKFLOW_PRESETS } from './presets.js';
@@ -154,6 +156,8 @@ interface ActiveRun {
   tailTimer?: NodeJS.Timeout | null;
   /** Current durable-log tail offset (bytes). */
   tailOffset?: number;
+  /** Backend that owns this run (for event normalization). */
+  backend?: WorkerBackend;
 }
 
 /** Handle for a worker process we did not spawn (reattached after restart). */
@@ -476,6 +480,7 @@ export class WorkerSupervisor {
       detached: true,
       tailTimer: null,
       tailOffset: replay.offsetBytes,
+      backend: this.backendFor(row),
     };
     this.active.set(row.id, run);
 
@@ -2030,9 +2035,9 @@ export class WorkerSupervisor {
 
     let handle: WorkerBackendHandle;
     const runRef: { current: ActiveRun | null } = { current: null };
+    const backend = this.backendFor(row);
 
     try {
-      const backend = this.backendFor(row);
       handle = backend.start(
         {
           workerId: row.id,
@@ -2101,6 +2106,7 @@ export class WorkerSupervisor {
       startedAt: new Date().toISOString(),
       done,
       resolveDone,
+      backend,
     };
     runRef.current = run;
     this.active.set(row.id, run);
@@ -2139,15 +2145,30 @@ export class WorkerSupervisor {
     return ev?.summary ?? 'Please review and improve your previous work.';
   }
 
-  private handleEvent(workerId: string, ev: DshEvent, usage: UsageTracker): void {
+  private handleEvent(workerId: string, raw: DshEvent, usage: UsageTracker): void {
     if (this.shutDown) return; // detached — worker outlives us; drop late events
-    if (ev.usage) usage.apply(ev.usage);
-    const run = this.active.get(workerId);
-    if (ev.byteOffset !== undefined) {
+    if (raw.byteOffset !== undefined) {
       // Durable parse checkpoint (complete JSONL records only).
-      this.store.updateWorker(workerId, { stdout_parse_offset: ev.byteOffset });
+      this.store.updateWorker(workerId, { stdout_parse_offset: raw.byteOffset });
     }
+    const run = this.active.get(workerId);
+    const backend = run?.backend;
+    let events: WorkerEvent[];
+    try {
+      events = backend ? backend.normalizeEvent(raw) : normalizeDshEvent(raw);
+    } catch {
+      events = [];
+    }
+    for (const ev of events) {
+      this.applyWorkerEvent(workerId, ev, usage, run);
+    }
+    // Best-effort budget enforcement after usage/tool/status events.
+    if (run && events.some((e) => e.type === 'usage' || e.type === 'tool_call' || e.type === 'status')) {
+      this.checkBudgets(workerId, run);
+    }
+  }
 
+  private applyWorkerEvent(workerId: string, ev: WorkerEvent, usage: UsageTracker, run: ActiveRun | undefined): void {
     switch (ev.type) {
       case 'session': {
         if (ev.sessionId) {
@@ -2164,15 +2185,29 @@ export class WorkerSupervisor {
           cache_read_tokens: snap.cache_read_tokens,
           total_tokens_last: snap.total_tokens_last,
         });
-        if (ev.phase) this.store.addEvent(workerId, 'status', ev.phase);
+        this.store.addEvent(workerId, 'status', ev.phase);
         if (ev.turn && run) run.lastTurn = Math.max(run.lastTurn, ev.turn);
         break;
       }
+      case 'usage': {
+        usage.apply({
+          ...(ev.inputTokens !== undefined ? { inputTokens: ev.inputTokens } : {}),
+          ...(ev.outputTokens !== undefined ? { outputTokens: ev.outputTokens } : {}),
+          ...(ev.cacheReadTokens !== undefined ? { cacheReadTokens: ev.cacheReadTokens } : {}),
+          ...(ev.totalTokens !== undefined ? { totalTokens: ev.totalTokens } : {}),
+        });
+        const snap = usage.snapshot();
+        this.store.updateWorker(workerId, {
+          input_tokens: snap.input_tokens,
+          output_tokens: snap.output_tokens,
+          cache_read_tokens: snap.cache_read_tokens,
+          total_tokens_last: snap.total_tokens_last,
+        });
+        break;
+      }
       case 'text': {
-        if (ev.text) {
-          const progress = ev.text.replace(/\s+/g, ' ').trim().slice(0, MAX_PROGRESS_CHARS);
-          this.store.updateWorker(workerId, { last_progress: progress });
-        }
+        const progress = ev.text.replace(/\s+/g, ' ').trim().slice(0, MAX_PROGRESS_CHARS);
+        this.store.updateWorker(workerId, { last_progress: progress });
         break;
       }
       case 'tool_call': {
@@ -2185,26 +2220,23 @@ export class WorkerSupervisor {
         break;
       }
       case 'final': {
-        if (ev.text) {
-          this.store.updateWorker(workerId, {
-            final_text: ev.text.slice(0, this.config.finalTextMaxChars),
-          });
-        }
+        this.store.updateWorker(workerId, {
+          final_text: ev.text.slice(0, this.config.finalTextMaxChars),
+        });
         this.store.addEvent(workerId, 'final', 'received');
         break;
       }
-      default: {
-        if (ev.malformed) {
-          this.store.addEvent(workerId, 'malformed', (ev.rawLine ?? '').slice(0, 120));
-        }
+      case 'malformed': {
+        this.store.addEvent(workerId, 'malformed', ev.preview.slice(0, 120));
+        break;
+      }
+      case 'error': {
+        this.store.addEvent(workerId, 'error', ev.message.slice(0, MAX_EVENT_SUMMARY));
+        break;
       }
     }
-
-    // Best-effort budget enforcement after every event.
-    if (run && (ev.type === 'status' || ev.type === 'tool_call')) {
-      this.checkBudgets(workerId, run);
-    }
   }
+
 
   /* ------------------------------------------------------------------ */
 

@@ -1,6 +1,9 @@
 import { spawn, execFileSync, type ChildProcess } from 'node:child_process';
 import fs from 'node:fs';
 import type { WorkerBackend, WorkerBackendHandle, BackendStartOptions, BackendEvents, BackendMetadata } from './types.js';
+import type { WorkerEvent } from './events.js';
+import { normalizeDshEvent } from './events.js';
+import type { DshEvent } from '../parser.js';
 
 export interface DshBackendOptions {
   dshBin: string;
@@ -42,6 +45,10 @@ export class DshBackend implements WorkerBackend {
   constructor(private opts: DshBackendOptions) {}
 
   /** Local availability only: executable exists and is runnable. No API calls. */
+  normalizeEvent(raw: DshEvent): WorkerEvent[] {
+    return normalizeDshEvent(raw);
+  }
+
   isAvailable(): boolean {
     try {
       fs.accessSync(this.opts.dshBin, fs.constants.X_OK);

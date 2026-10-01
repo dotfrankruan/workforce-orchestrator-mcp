@@ -3,6 +3,9 @@ import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { parseDshLine } from '../parser.js';
 import type { WorkerBackend, WorkerBackendHandle, BackendStartOptions, BackendEvents } from './types.js';
+import type { WorkerEvent } from './events.js';
+import { normalizeDshEvent } from './events.js';
+import type { DshEvent } from '../parser.js';
 
 /**
  * FakeWorkerBackend — simulates a dsh run for tests and local development,
@@ -60,6 +63,10 @@ export class FakeBackend implements WorkerBackend {
 
   isAvailable(): boolean {
     return true;
+  }
+
+  normalizeEvent(raw: DshEvent): WorkerEvent[] {
+    return normalizeDshEvent(raw);
   }
 
   start(opts: BackendStartOptions, events: BackendEvents): WorkerBackendHandle {

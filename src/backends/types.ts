@@ -1,4 +1,5 @@
 import type { DshEvent } from '../parser.js';
+import type { WorkerEvent } from './events.js';
 import type { TaskMode } from '../modes.js';
 
 /* ------------------------------------------------------------------ *
@@ -81,4 +82,7 @@ export interface WorkerBackend {
   /** Optional runtime/provider facts known without contacting the provider. */
   metadata?(): BackendMetadata;
   start(opts: BackendStartOptions, events: BackendEvents): WorkerBackendHandle;
+  /** Adapt one raw backend event into normalized worker events (may drop:
+   *  thinking never reaches the supervisor). */
+  normalizeEvent(raw: DshEvent): WorkerEvent[];
 }

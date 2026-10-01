@@ -125,7 +125,8 @@ import type {
   BackendStartOptions,
   BackendEvents,
 } from '../backends/types.js';
-import { parseDshLine } from '../parser.js';
+import { parseDshLine, type DshEvent } from '../parser.js';
+import { normalizeDshEvent as normalizeDshEventForTest } from '../backends/events.js';
 
 export interface ProcStep {
   emit?: Record<string, unknown>;
@@ -156,6 +157,10 @@ export class ProcScriptBackend implements WorkerBackend {
 
   isAvailable(): boolean {
     return true;
+  }
+
+  normalizeEvent(raw: import('../parser.js').DshEvent) {
+    return normalizeDshEventForTest(raw);
   }
 
   constructor(private scenario: (info: { workerId: string; resume: boolean }) => { steps: ProcStep[]; exitCode?: number }) {}
