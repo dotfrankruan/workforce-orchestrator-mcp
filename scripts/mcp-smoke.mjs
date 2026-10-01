@@ -158,6 +158,8 @@ try {
   console.log('✓ list_roles:', roles.roles.length, '| list_presets:', presets.presets.length);
   const dryRun = await tool('run_workflow_preset', { preset: 'research_report', goal: 'smoke', options: { dry_run: true } });
   console.log('✓ run_workflow_preset dry_run:', dryRun.tasks.length, 'tasks planned, nothing spawned');
+  const backends = await tool('list_backends');
+  console.log('✓ list_backends:', backends.backends.map((b) => `${b.id}${b.default ? '(default)' : ''}${b.available ? '' : '(unavailable)'}`).join(', '));
   const sys = await tool('get_system_metrics');
   console.log('✓ get_system_metrics: tasks.total =', sys.tasks.total, '| cache:', JSON.stringify(sys.cache));
 

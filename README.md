@@ -1,11 +1,80 @@
-# Kimi Workforce MCP
+# Workforce Orchestrator MCP
+
+*Formerly Kimi Workforce MCP.* A universal execution workforce for Codex.
 
 MCP server that turns **Codex** (planner / architect / reviewer) into an
-orchestrator over **Kimi K3 execution workers** (DeepSeek Harness headless) —
-task DAGs, workflows, budgets, role templates, acceptance tracking, metrics,
-and an artifact cache.
+orchestrator over pluggable runtime backends — task DAGs, workflows, budgets,
+role templates, acceptance tracking, metrics, and an artifact cache.
 
-**Codex thinks. Kimi executes. The orchestrator schedules. The supervisor owns state and Git. Humans retain final control.**
+**Codex thinks. Workers execute. The orchestrator schedules. The supervisor owns state and Git. Humans retain final control.**
+
+```
+                         Codex Root
+                             │
+                             ▼
+                   Workforce Orchestrator
+                             │
+                       Backend Router
+                             │
+            ┌────────────────┼───────────────┐
+            ▼                ▼               ▼
+           DSH          future Claude    future OpenCode
+            │          Code adapter      adapter
+       runtime config
+            │
+         current:
+       Kimi K3 (via DSH headless profile)
+```
+
+## Zero-config guarantee (existing users: nothing to change)
+
+If you used this project before v5: **you do not need to change anything.**
+With no config file and no env vars, the orchestrator automatically uses:
+
+```
+/usr/local/bin/dsh --profile headless --json
+```
+
+(falling back to `dsh` on PATH). The runtime (DSH) owns its own provider
+configuration and credentials (`~/.dsh/.env`) — the orchestrator never reads
+them. Your Codex MCP config (`[mcp_servers.kimi]`, the name is yours) keeps
+working unchanged. Old databases migrate automatically (schema v1→v6).
+
+Optional configuration, only if you ever want it:
+
+```jsonc
+// ~/.workforce/config.json  (optional — never required)
+{
+  "default_backend": "dsh",
+  "backends": { "dsh": { "command": "/usr/local/bin/dsh", "profile": "headless" } },
+  "routing": { "roles": { "reviewer": "dsh" } }
+}
+```
+
+Env overrides: `WORKFORCE_DEFAULT_BACKEND`, `WORKFORCE_DSH_COMMAND`,
+`WORKFORCE_DSH_PROFILE` (legacy `KIMI_WORKER_*` env vars keep working).
+
+## What's new in v5
+
+- **Universal backend architecture**: Orchestrator ≠ runtime backend ≠ model
+  provider. `WorkerBackend` interface with capabilities, local availability
+  (no API calls), and runtime metadata (facts only — provider/model never
+  guessed).
+- **Backend registry + deterministic router**: explicit task backend > role
+  routing rule > config default > env > built-in dsh. **No automatic
+  expensive fallback** — exhaustion returns control to the human.
+- **Normalized WorkerEvent model**: supervisor/budgets/metrics consume
+  backend-agnostic events; DSH JSONL is just the first adapter (`thinking`
+  never leaves the durable log).
+- `spawn_task(..., backend)` + workflow task backends; `list_backends` /
+  `get_backend`; CLI `backends` / `backend <id>`.
+- `max_worker_tokens` (canonical; `max_kimi_tokens` remains a readable
+  deprecated alias); per-backend metrics split; cache keys include
+  backend_id.
+- Zero-config compatibility: existing Kimi+DSH setups upgrade in place with
+  no configuration migration.
+- Schema v6: `backend_id` (old rows factually backfilled `dsh`) +
+  `backend_metadata`.
 
 ## What's new in v4
 
