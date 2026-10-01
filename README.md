@@ -144,6 +144,63 @@ Each mode has its own prompt template under [src/prompts/](src/prompts/)
 - **temporary** — fresh `~/.kimi-workers/tasks/<id>/workspace/`, kept after
   completion (no auto-delete).
 
+## Parallel git isolation (v4.1)
+
+**Invariant: two git-writing tasks never share a physical worktree. Parallel execution, serialized integration.**
+
+```
+                    workflow integration branch
+                     kimi-workflow/<wf-id>
+                             │  (integration worktree — supervisor only)
+                 ┌───────────┴───────────┐
+                 │                       │
+             task branch B           task branch C
+             kimi-task/<id-B>        kimi-task/<id-C>
+             worktree B              worktree C          ← isolated, same snapshot
+                 │                       │
+              Kimi B                  Kimi C             ← truly parallel
+                 │                       │
+             commit B                commit C            ← supervisor commits
+                 └───────────┬───────────┘
+                             │
+                 Supervisor serialized cherry-pick queue
+                             │
+                        workflow HEAD                    ← review target:
+                                                           base_ref...kimi-workflow/<wf-id>
+```
+
+- Each git-workflow task is materialized at run start from the **current
+  integration HEAD** (`workspace_base_commit` is recorded — reviewers always
+  know exactly which repo state a task saw).
+- After a task completes, the supervisor cherry-picks its commits onto the
+  integration branch, serialized through a per-workflow async mutex.
+- **Conflicts are surfaced, never auto-resolved**: the pick is aborted
+  (integration branch restored clean), the task gets `integration=conflict`
+  with conflicting files/commits recorded, and downstream dependents keep
+  waiting — they never start from a HEAD missing their dependency.
+- Resolution path: `continue_worker` on the conflicted task — it gets a
+  fresh worktree branched from the latest integration HEAD (old branch kept
+  for audit), re-implements against current state, and integration retries
+  automatically.
+- Read-only snapshots: every task's view is pinned to its
+  `workspace_base_commit`; later integrations never mutate a running task's
+  view.
+- Non-git workflows (temporary/directory) keep shared-workspace semantics;
+  parallel writers in a shared directory can still conflict — snapshot/
+  copy-on-write is future work.
+- Supervisor git command set: `status diff add commit rev-parse log
+  cherry-pick(+--abort) worktree branch`. Never push/merge/reset/clean/rebase.
+
+## Backend failure handoff
+
+Retries follow the configured policy (`retry.max_attempts`, `retry_on`) and
+nothing is guessed from provider-specific error strings or HTTP codes. When
+attempts are exhausted, the task result carries `attempts`,
+`retries_exhausted: true`, `work_preserved: true` — and server instructions
+tell Codex to **return control to the human** (report the failure, note the
+preserved work, ask: retry later / do it Codex-side / abandon), never
+silently substituting expensive Codex-side execution.
+
 ## Requirements
 
 - macOS (developed on) / Linux (should work)
@@ -193,6 +250,7 @@ KIMI_WORKER_ROOT = "~/.kimi-workers"
 | `wait_workflow` | Event-driven wait for workflow terminal state. |
 | `cancel_workflow` | Cancel all non-terminal tasks; preserves workspaces/artifacts. |
 | `get_workflow_result` | Compact aggregate: per-task outcomes, artifacts, metrics, warnings. |
+| `get_workflow_diff` | base…integration-HEAD diff (stat default, capped). |
 | `review_task_result` | Record acceptance (accepted/rejected/needs_revision). |
 | `get_task_metrics` / `get_workflow_metrics` / `get_system_metrics` | Objective counters and quality stats. |
 
@@ -440,7 +498,8 @@ queued ──► starting ──► running ──► completed
 - Existing SQLite databases **migrate automatically** (schema_meta v1→v2→v3:
   v2 adds mode/workspace/deliverables/artifacts; v3 adds orchestration columns
   on workers plus workflows/workflow_tasks/task_attempts/task_reviews/
-  artifact_cache tables). Pre-upgrade rows read as `mode=code`,
+  artifact_cache tables; v4 adds task_branch/workspace_base_commit/
+  task_commits/integration_* for parallel git isolation). Pre-upgrade rows read as `mode=code`,
   `workspace_type=git_worktree`, `workflow_id=null`. No manual migration, no
   data loss.
 
@@ -504,6 +563,8 @@ node scripts/mcp-smoke.mjs /path/to/git/repo   # MCP protocol smoke (fake backen
 node scripts/real-dsh-e2e.mjs                  # real coding E2E (live API, temp repo)
 node scripts/research-e2e.mjs                  # real research E2E (live API, no web dependency)
 node scripts/wait-e2e.mjs                      # real parallel wait E2E (two live tasks + wait_tasks)
+node scripts/workflow-e2e.mjs                  # real 3-task DAG E2E (live API)
+node scripts/parallel-e2e.mjs                  # real parallel git writers E2E (live API)
 ```
 
 ## Security
