@@ -333,6 +333,13 @@ async function main(): Promise<void> {
       break;
     }
 
+    case 'cache-stats': {
+      const { supervisor, store } = openSupervisor();
+      printJson(supervisor.cacheStats());
+      store.close();
+      break;
+    }
+
     case 'inspect': {
       const id = rest[0];
       if (!id) usage();

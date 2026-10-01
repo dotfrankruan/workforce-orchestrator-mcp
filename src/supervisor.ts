@@ -63,6 +63,11 @@ import {
 import type { WorkerBackend, WorkerBackendHandle } from './backend/types.js';
 import { getRole, BUILT_IN_ROLES } from './roles.js';
 import { getPreset, presetNames, WORKFLOW_PRESETS } from './presets.js';
+import {
+  computeCacheKey,
+  workspaceFingerprint,
+  PROMPT_TEMPLATE_VERSION,
+} from './cache.js';
 
 /* ------------------------------------------------------------------ *
  * Spawn inputs
@@ -112,6 +117,7 @@ export interface SpawnTaskResult {
   branch: string | null;
   session_id: string | null;
   queued: boolean;
+  cache?: { hit: boolean; source_task_id?: string; age_seconds?: number; artifacts_reused?: number; artifact_bytes?: number } | undefined;
 }
 
 /** Workflow task spec: dependencies use per-workflow keys, not task ids. */
@@ -387,7 +393,7 @@ export class WorkerSupervisor {
     }
     fs.mkdirSync(plan.logDir, { recursive: true, mode: 0o700 });
 
-    const row = this.store.createWorker({
+    this.store.createWorker({
       id,
       repo_path: plan.repoPath,
       base_ref: plan.baseRef,
@@ -419,7 +425,81 @@ export class WorkerSupervisor {
       `mode=${resolved.mode} workspace=${plan.type}${plan.branch ? ` branch=${plan.branch}` : ''}${dependsOn.length ? ` deps=${dependsOn.join(',')}` : ''}${params.role ? ` role=${params.role}` : ''}`,
     );
 
-    this.schedule();
+    // Artifact/analysis cache (opt-in). Only for dependency-free tasks —
+    // the fingerprint cannot capture upstream artifacts of dependencies.
+    let cacheInfo: SpawnTaskResult['cache'];
+    if (cachePolicy !== 'off') {
+      const fingerprint = workspaceFingerprint(plan.type, plan.cwd);
+      const key = computeCacheKey({
+        mode: resolved.mode,
+        role: params.role ?? null,
+        roleFragment: params.role ? (getRole(params.role)?.promptFragment ?? null) : null,
+        task: params.task,
+        fingerprint,
+      });
+      // Persisted so finalize can write the entry even after a restart.
+      this.store.addEvent(id, 'cache_key', JSON.stringify({ key, fingerprint }));
+
+      if (cachePolicy === 'read' || cachePolicy === 'read_write') {
+        const hit = this.store.cacheGet(key);
+        if (hit) {
+          const src = this.store.getWorker(hit.task_id);
+          const srcRoot = src?.worktree_path;
+          if (src && src.status === 'completed' && srcRoot && fs.existsSync(srcRoot)) {
+            // Reuse the source task's artifacts: copy them into this task's
+            // workspace and index them. No new DSH session is created.
+            let copied = 0;
+            let bytes = 0;
+            for (const a of this.store.listArtifacts(src.id)) {
+              if (!fs.existsSync(a.absolute_path)) continue;
+              try {
+                const dest = resolveUnderRoot(plan.artifactRoot, a.relative_path);
+                fs.mkdirSync(path.dirname(dest), { recursive: true });
+                fs.copyFileSync(a.absolute_path, dest);
+                const st = fs.statSync(dest);
+                this.store.upsertArtifact({
+                  task_id: id,
+                  relative_path: a.relative_path,
+                  absolute_path: dest,
+                  mime_type: a.mime_type,
+                  size_bytes: st.size,
+                  sha256: sha256File(dest),
+                });
+                copied++;
+                bytes += st.size;
+              } catch {
+                /* skip single artifact copy failure */
+              }
+            }
+            this.store.cacheHit(key);
+            const now = new Date().toISOString();
+            this.store.updateWorker(id, {
+              status: 'completed',
+              started_at: now,
+              finished_at: now,
+              final_text: src.final_text,
+            });
+            this.store.addEvent(id, 'cache_hit', `source=${hit.task_id} artifacts=${copied}`);
+            this.notifyWaiters(id);
+            this.onTaskTerminal(this.get(id));
+            cacheInfo = {
+              hit: true,
+              source_task_id: hit.task_id,
+              age_seconds: Math.round((Date.now() - Date.parse(hit.created_at)) / 1000),
+              artifacts_reused: copied,
+              artifact_bytes: bytes,
+            };
+          } else {
+            this.store.addEvent(id, 'cache_stale', `source task ${hit.task_id} unusable; executing normally`);
+          }
+        }
+      }
+    }
+
+    let row = this.get(id)!;
+    if (!cacheInfo) {
+      this.schedule();
+    }
 
     return {
       task_id: id,
@@ -427,8 +507,9 @@ export class WorkerSupervisor {
       mode: resolved.mode,
       workspace: { type: plan.type, path: plan.cwd },
       branch: plan.branch || null,
-      session_id: null,
+      session_id: row.session_id,
       queued: row.status === 'queued',
+      ...(cacheInfo ? { cache: cacheInfo } : {}),
     };
   }
 
@@ -2006,6 +2087,39 @@ export class WorkerSupervisor {
     }
 
     finishTerminal(provisional, provisionalError);
+    this.maybeWriteCache(workerId, provisional);
+  }
+
+  /** Write the artifact-cache entry after a successful cacheable run. */
+  private maybeWriteCache(workerId: string, status: WorkerStatus): void {
+    if (status !== 'completed') return;
+    const row = this.get(workerId);
+    if (row.cache_policy !== 'read_write' && row.cache_policy !== 'refresh') return;
+    const keyEvent = this.store.listEvents(workerId, 100).find((e) => e.type === 'cache_key');
+    if (!keyEvent?.summary) return;
+    try {
+      const { key, fingerprint } = JSON.parse(keyEvent.summary) as { key: string; fingerprint: string };
+      const artifacts = this.store.listArtifacts(workerId);
+      if (artifacts.length === 0) return;
+      this.store.cachePut({
+        cache_key: key,
+        task_id: workerId,
+        mode: row.mode,
+        role: row.role,
+        workspace_fingerprint: fingerprint,
+        prompt_version: String(PROMPT_TEMPLATE_VERSION),
+        artifact_count: artifacts.length,
+        artifact_bytes: artifacts.reduce((s, a) => s + a.size_bytes, 0),
+        created_at: new Date().toISOString(),
+      });
+      this.store.addEvent(workerId, 'cache_write', `${artifacts.length} artifacts cached`);
+    } catch {
+      /* cache write is best-effort */
+    }
+  }
+
+  cacheStats(): Record<string, unknown> {
+    return this.store.cacheStats();
   }
 
   /** Workflow bookkeeping after any task reaches a terminal state. */
