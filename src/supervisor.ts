@@ -148,6 +148,8 @@ interface ActiveRun {
   /** Reattached run: no ChildProcess handle, monitored via pid + JSONL tail. */
   detached?: boolean;
   tailTimer?: NodeJS.Timeout | null;
+  /** Current durable-log tail offset (bytes). */
+  tailOffset?: number;
 }
 
 /** Handle for a worker process we did not spawn (reattached after restart). */
@@ -458,6 +460,7 @@ export class WorkerSupervisor {
       resolveDone,
       detached: true,
       tailTimer: null,
+      tailOffset: replay.offsetBytes,
     };
     this.active.set(row.id, run);
 
@@ -493,64 +496,71 @@ export class WorkerSupervisor {
       run.timeoutTimer.unref();
     }
 
-    // Tail the durable JSONL from the persisted offset; detect exit via pid.
+    // Reattached: no ChildProcess handle — detect exit via pid liveness.
+    this.startTailer(row.id, run, true);
+  }
+
+  /**
+   * Shared durable-log tailer: parses complete JSONL records from the file
+   * from the run's tailOffset (never mid-line), updates counters, and
+   * optionally detects process exit via pid liveness (reattached runs).
+   * Correctness over purity: 500ms poll, no fragile fs.watch assumptions.
+   */
+  /** Drain new complete JSONL records from the durable log into the run. */
+  private drainLog(workerId: string, run: ActiveRun): void {
+    const row = this.store.getWorker(workerId);
+    if (!row) return;
     const stdoutPath = path.join(row.log_dir, 'stdout.jsonl');
-    let offset = replay.offsetBytes;
-    let inFlight = false;
+    const size = fs.existsSync(stdoutPath) ? fs.statSync(stdoutPath).size : 0;
+    let offset = run.tailOffset ?? 0;
+    if (size <= offset) return;
+    const fd = fs.openSync(stdoutPath, 'r');
+    const buf = Buffer.alloc(size - offset);
+    fs.readSync(fd, buf, 0, buf.length, offset);
+    fs.closeSync(fd);
+    const chunk = buf.toString('utf8');
+    const lines = chunk.split('\n');
+    // Last element is the partial/empty tail — leave it for next time.
+    for (const line of lines.slice(0, -1)) {
+      offset += Buffer.byteLength(line, 'utf8') + 1;
+      const ev = parseDshLine(line);
+      if (ev) {
+        ev.byteOffset = offset;
+        this.handleEvent(workerId, ev, run.usage);
+      }
+    }
+    run.tailOffset = offset;
+    this.store.updateWorker(workerId, { stdout_parse_offset: offset });
+  }
+
+  private startTailer(workerId: string, run: ActiveRun, watchPid: boolean): void {
+    const row = this.store.getWorker(workerId);
+    if (!row) return;
+    const pid = row.pid;
+
+    const drain = () => this.drainLog(workerId, run);
+
     const poll = () => {
-      const current = this.active.get(row.id);
-      if (current !== run) return; // superseded
-      if (inFlight) return;
-      inFlight = true;
+      if (this.shutDown) return;
+      if (this.active.get(workerId) !== run) return; // superseded
       try {
-        const size = fs.existsSync(stdoutPath) ? fs.statSync(stdoutPath).size : 0;
-        if (size > offset) {
-          const fd = fs.openSync(stdoutPath, 'r');
-          const buf = Buffer.alloc(size - offset);
-          fs.readSync(fd, buf, 0, buf.length, offset);
-          fs.closeSync(fd);
-          const chunk = buf.toString('utf8');
-          const lines = chunk.split('\n');
-          // Last element is the partial/empty tail — never parse it now.
-          const complete = lines.slice(0, -1);
-          let consumed = 0;
-          for (const line of complete) {
-            consumed += Buffer.byteLength(line, 'utf8') + 1;
-            const ev = parseDshLine(line);
-            if (ev) {
-              ev.byteOffset = offset + consumed;
-              this.handleEvent(row.id, ev, usage);
-            }
-          }
-          offset += consumed;
-          this.store.updateWorker(row.id, { stdout_parse_offset: offset });
-        }
+        drain();
       } catch {
         /* read race — retry next poll */
-      } finally {
-        inFlight = false;
       }
-
-      // Exit detection: process gone → final drain → finalize.
-      if (!pidAlive(row.pid!)) {
-        // One more drain pass on the next tick to catch the final bytes.
+      if (watchPid && pid && !pidAlive(pid)) {
+        // Process gone: final drain on the next tick, then finalize with an
+        // UNKNOWN exit code (null — never fabricated).
         setTimeout(() => {
           try {
-            const size = fs.existsSync(stdoutPath) ? fs.statSync(stdoutPath).size : 0;
-            if (size > offset) {
-              const content = fs.readFileSync(stdoutPath, 'utf8').slice(offset);
-              for (const line of content.split('\n')) {
-                const ev = parseDshLine(line);
-                if (ev) this.handleEvent(row.id, ev, usage);
-              }
-              offset = size;
-            }
-          } catch { /* ignore */ }
-          if (run.tailTimer) clearTimeout(run.tailTimer);
-          void this.finalize(row.id, null, null).finally(() => {
-            if (this.active.get(row.id) === run) this.active.delete(row.id);
+            drain();
+          } catch {
+            /* ignore */
+          }
+          void this.finalize(workerId, null, null).finally(() => {
+            if (this.active.get(workerId) === run) this.active.delete(workerId);
             if (run.timeoutTimer) clearTimeout(run.timeoutTimer);
-            resolveDone();
+            run.resolveDone();
             this.schedule();
           });
         }, 100).unref();
@@ -2015,6 +2025,17 @@ export class WorkerSupervisor {
             this.store.addEvent(row.id, 'spawn_error', redactSecrets(err.message).slice(0, MAX_EVENT_SUMMARY));
           },
           onExit: (code, signal) => {
+            const run0 = runRef.current;
+            if (run0?.tailTimer) clearTimeout(run0.tailTimer);
+            if (run0 && this.backend.durableStdout) {
+              // Final drain of the durable log before finalizing (the tailer
+              // may lag a few hundred ms behind the process).
+              try {
+                this.drainLog(row.id, run0);
+              } catch {
+                /* ignore */
+              }
+            }
             void this.finalize(row.id, code, signal).finally(() => {
               const run = runRef.current;
               // finalize() may have chained a follow-up run which already
@@ -2058,6 +2079,18 @@ export class WorkerSupervisor {
     };
     runRef.current = run;
     this.active.set(row.id, run);
+
+    if (this.backend.durableStdout) {
+      // Events flow exclusively through the durable log tailer.
+      run.tailOffset = (() => {
+        try {
+          return fs.statSync(stdoutPath).size;
+        } catch {
+          return 0;
+        }
+      })();
+      this.startTailer(row.id, run, false);
+    }
 
     const pidIdentity = handle.pid ? (captureProcessIdentity(handle.pid)?.startToken ?? null) : null;
     this.store.updateWorker(row.id, { status: 'running', pid: handle.pid, pid_identity: pidIdentity });

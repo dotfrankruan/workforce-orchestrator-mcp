@@ -40,5 +40,9 @@ export interface WorkerBackend {
   /** Marker expected in a worker process command line (used by reattach
    * identity checks; omit for in-process backends without real pids). */
   readonly processMarker?: string;
+  /** When true, the backend redirects child stdout/stderr directly to the
+   * durable log files and does NOT emit parsed events — the supervisor tails
+   * the files instead (shared with the reattach path). */
+  readonly durableStdout?: boolean;
   start(opts: BackendStartOptions, events: BackendEvents): WorkerBackendHandle;
 }

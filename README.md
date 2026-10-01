@@ -191,6 +191,37 @@ Each mode has its own prompt template under [src/prompts/](src/prompts/)
 - Supervisor git command set: `status diff add commit rev-parse log
   cherry-pick(+--abort) worktree branch`. Never push/merge/reset/clean/rebase.
 
+## Durable worker supervision (v4.1.1)
+
+**Supervisor state is ephemeral. Worker execution state is durable.** Losing
+the supervisor is NOT losing the worker.
+
+- DSH child processes write stdout/stderr **directly to durable log files**
+  (`stdout.jsonl` / `stderr.log`) — never through a supervisor-owned pipe —
+  so a supervisor crash/restart never breaks the worker's output channel.
+- Every active run persists: `pid`, process start token (ps `lstart`),
+  `session_id`, `run_started_at`, and a byte-level `stdout_parse_offset`
+  checkpoint (complete records only).
+- On restart, reconciliation is a three-way decision:
+  - **live pid + matching identity** → *reattach*: replay the log, restore
+    token/tool/iteration counters, resume tailing from the checkpoint,
+    re-arm the remaining execution timeout (computed from the original run
+    start — never extended), and enforce budgets against merged usage.
+  - **dead pid + durable `final` event** → full normal finalization (result,
+    supervisor git commit, integration) with `exit_code: null` — never
+    fabricated.
+  - **dead pid + no terminal evidence** → `interrupted` (the only meaning of
+    that status). Logs, worktrees, artifacts are preserved.
+- Graceful server shutdown **detaches** workers instead of killing them;
+  only `cancel_worker` / `cancel_workflow` / timeout / budget terminate
+  worker processes.
+- Reattachment never creates duplicate attempts, commits, cherry-picks, or
+  artifact entries (attempt guard + `integrated_commits` dedupe + upserts).
+- `get_system_metrics().supervision` reports `supervisor_restarts_observed`,
+  `workers_reattached`, `workers_genuinely_interrupted`.
+- `get_worker` exposes `supervision` (`attached`/`reattached`/`detached`) and
+  `process_alive`; CLI `inspect` has a `process` diagnostics block.
+
 ## Backend failure handoff
 
 Retries follow the configured policy (`retry.max_attempts`, `retry_on`) and
@@ -565,6 +596,7 @@ node scripts/research-e2e.mjs                  # real research E2E (live API, no
 node scripts/wait-e2e.mjs                      # real parallel wait E2E (two live tasks + wait_tasks)
 node scripts/workflow-e2e.mjs                  # real 3-task DAG E2E (live API)
 node scripts/parallel-e2e.mjs                  # real parallel git writers E2E (live API)
+node scripts/reattach-e2e.mjs                  # real supervisor-restart reattach E2E (live API)
 ```
 
 ## Security

@@ -1,6 +1,5 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import fs from 'node:fs';
-import { parseDshLine } from '../parser.js';
 import type { WorkerBackend, WorkerBackendHandle, BackendStartOptions, BackendEvents } from './types.js';
 
 export interface DshBackendOptions {
@@ -13,14 +12,23 @@ export interface DshBackendOptions {
  *
  *   /usr/local/bin/dsh --profile headless --json [--session-id <id>] "<prompt>"
  *
- * Always spawned with an argv array — never through a shell — so the prompt
- * and session id cannot be used for shell injection. Credentials are left to
- * dsh itself (~/.dsh/.env); this process never reads or forwards them.
+ * Durability by construction: the child's stdout/stderr are redirected
+ * DIRECTLY to the durable log files (stdout.jsonl / stderr.log), never
+ * through a pipe owned by this process — so the worker keeps writing even if
+ * the supervisor dies. The supervisor parses the file via its tailer
+ * (reattach path and live path share that machinery). Exit codes come from
+ * the ChildProcess handle while attached; after a reattach they are
+ * unavailable and left null (never fabricated).
+ *
+ * Always spawned with an argv array — never a shell string. Credentials are
+ * left to dsh itself (~/.dsh/.env); this process never reads or forwards them.
  */
 export class DshBackend implements WorkerBackend {
   readonly name = 'dsh';
   /** Marker expected in the worker process command line (reattach identity). */
   readonly processMarker = 'dsh';
+  /** stdout/stderr go straight to files; the supervisor tails them. */
+  readonly durableStdout = true;
 
   constructor(private opts: DshBackendOptions) {}
 
@@ -34,21 +42,18 @@ export class DshBackend implements WorkerBackend {
     // not document one).
     args.push(opts.prompt);
 
-    // Synchronous appends: the on-disk log stays consistent with the event
-    // stream even if the process exits abruptly, and nothing is lost in a
-    // half-flushed stream buffer.
-    fs.closeSync(fs.openSync(opts.stdoutPath, 'a'));
-    fs.closeSync(fs.openSync(opts.stderrPath, 'a'));
-
+    let outFd: number;
+    let errFd: number;
     let child: ChildProcess;
     try {
+      outFd = fs.openSync(opts.stdoutPath, 'a');
+      errFd = fs.openSync(opts.stderrPath, 'a');
       child = spawn(this.opts.dshBin, args, {
         cwd: opts.cwd,
         env: process.env,
-        stdio: ['ignore', 'pipe', 'pipe'],
+        stdio: ['ignore', outFd, errFd],
       });
     } catch (err) {
-      // Defer so callers can finish wiring handlers.
       queueMicrotask(() => {
         events.onSpawnError?.(err as Error);
         events.onExit(null, null);
@@ -56,58 +61,23 @@ export class DshBackend implements WorkerBackend {
       return new NullHandle();
     }
 
+    const closeFds = () => {
+      try { fs.closeSync(outFd); } catch { /* ignore */ }
+      try { fs.closeSync(errFd); } catch { /* ignore */ }
+    };
+
     let exited = false;
-    let lineBuf = '';
-    let byteOffset = 0;
-
-    child.stdout?.setEncoding('utf8');
-    child.stdout?.on('data', (chunk: string) => {
-      try {
-        fs.appendFileSync(opts.stdoutPath, chunk);
-      } catch {
-        /* log dir gone — keep parsing regardless */
-      }
-      lineBuf += chunk;
-      let idx: number;
-      while ((idx = lineBuf.indexOf('\n')) >= 0) {
-        const line = lineBuf.slice(0, idx);
-        lineBuf = lineBuf.slice(idx + 1);
-        byteOffset += Buffer.byteLength(line, 'utf8') + 1;
-        const ev = parseDshLine(line);
-        if (ev) {
-          ev.byteOffset = byteOffset;
-          events.onEvent(ev);
-        }
-      }
-    });
-
-    child.stderr?.setEncoding('utf8');
-    child.stderr?.on('data', (chunk: string) => {
-      try {
-        fs.appendFileSync(opts.stderrPath, chunk);
-      } catch {
-        /* log dir gone */
-      }
-      events.onStderr?.(chunk);
-    });
-
     child.on('error', (err) => {
-      // spawn failure (e.g. ENOENT) — 'close' may not fire reliably.
       if (exited) return;
       exited = true;
+      closeFds();
       events.onSpawnError?.(err);
       events.onExit(null, null);
     });
-
     child.on('close', (code, signal) => {
       if (exited) return;
       exited = true;
-      // Flush any trailing line without a newline.
-      if (lineBuf.trim() !== '') {
-        const ev = parseDshLine(lineBuf);
-        if (ev) events.onEvent(ev);
-        lineBuf = '';
-      }
+      closeFds();
       events.onExit(code, signal);
     });
 
@@ -157,7 +127,6 @@ class DshHandle implements WorkerBackendHandle {
         } catch {
           /* already gone */
         }
-        // Give the OS a moment to reap; 'close' will call done() anyway.
         setTimeout(done, 200).unref();
       }, graceMs);
       killTimer.unref();
