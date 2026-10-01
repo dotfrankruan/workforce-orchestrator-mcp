@@ -385,6 +385,80 @@ export function createMcpServer(supervisor: WorkerSupervisor): McpServer {
   );
 
   server.registerTool(
+    'run_workflow_preset',
+    {
+      title: 'Run workflow preset',
+      description:
+        'Expand a built-in workflow preset (bug_fix, feature_development, quality_audit, research_report, data_analysis — see list_presets) into a task DAG around one goal and start it. Returns workflow_id + task mapping immediately. The expanded plan is always visible via get_workflow; pass options.dry_run=true to inspect the plan without spawning.',
+      inputSchema: {
+        preset: z.string().describe('Preset name (see list_presets).'),
+        goal: z.string().describe('The concrete goal the preset orchestrates, e.g. "fix the flaky reconnect in transport.ts".'),
+        workspace: z
+          .object({
+            type: z.enum(['git_worktree', 'directory', 'temporary']).optional(),
+            path: z.string().optional(),
+            repo_path: z.string().optional(),
+            base_ref: z.string().optional(),
+          })
+          .optional()
+          .describe('Shared workspace for the whole workflow. Required (repo_path) for git-based presets like bug_fix/feature_development/quality_audit.'),
+        budget: z
+          .object({
+            max_duration_seconds: z.number().int().positive().optional(),
+            max_kimi_tokens: z.number().int().positive().optional(),
+            max_concurrent_tasks: z.number().int().positive().optional(),
+            max_tasks: z.number().int().positive().optional(),
+          })
+          .optional(),
+        failure_policy: z.enum(['continue', 'stop_dependents', 'cancel_remaining']).optional(),
+        options: z.object({ dry_run: z.boolean().optional() }).optional(),
+      },
+      annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
+    },
+    async (args) => {
+      try {
+        return jsonResult(supervisor.runWorkflowPreset(args as Parameters<typeof supervisor.runWorkflowPreset>[0]));
+      } catch (err) {
+        return errorResult(err);
+      }
+    },
+  );
+
+  server.registerTool(
+    'list_roles',
+    {
+      title: 'List role templates',
+      description: 'List built-in worker role templates (implementer, tester, researcher, reviewer, docs_writer, data_analyst, debugger, ops_analyst) with their defaults. Roles shape worker prompts; modes select workspace/runtime behavior.',
+      inputSchema: {},
+      annotations: READ_ONLY,
+    },
+    async () => {
+      try {
+        return jsonResult({ roles: supervisor.listRoles() });
+      } catch (err) {
+        return errorResult(err);
+      }
+    },
+  );
+
+  server.registerTool(
+    'list_presets',
+    {
+      title: 'List workflow presets',
+      description: 'List built-in workflow presets with their task graphs (keys, modes, roles, dependencies). Use run_workflow_preset to execute one around a concrete goal.',
+      inputSchema: {},
+      annotations: READ_ONLY,
+    },
+    async () => {
+      try {
+        return jsonResult({ presets: supervisor.listPresets() });
+      } catch (err) {
+        return errorResult(err);
+      }
+    },
+  );
+
+  server.registerTool(
     'get_task_result',
     {
       title: 'Get task result (compact)',

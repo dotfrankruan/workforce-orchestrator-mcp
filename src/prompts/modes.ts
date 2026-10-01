@@ -2,7 +2,7 @@ import { rulesBlock, taskBlock, FINAL_REPORT_GUIDE, type PromptContext } from '.
 
 function compose(intro: string, ctx: PromptContext, extra = ''): string {
   return `${intro}
-
+${ctx.roleFragment ? `\n${ctx.roleFragment}\n` : ''}
 ${rulesBlock(ctx)}
 
 ${taskBlock(ctx.task)}

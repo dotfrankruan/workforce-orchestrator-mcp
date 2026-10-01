@@ -20,7 +20,7 @@ Prefer acting over explaining.
 Do not ask the supervising planner questions unless the task is impossible to infer from the repository and instructions.
 
 Do NOT attempt to create a git commit unless explicitly instructed by the supervisor — git metadata may be outside your writable sandbox. The supervising MCP process will verify, stage, and commit your changes after you finish. Not being able to commit is NOT a task failure.
-
+${ctx.roleFragment ? `\n${ctx.roleFragment}\n` : ''}
 ${rulesBlock(ctx)}
 
 ${taskBlock(ctx.task)}

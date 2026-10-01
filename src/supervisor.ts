@@ -61,6 +61,8 @@ import {
   type CollectedFile,
 } from './artifacts.js';
 import type { WorkerBackend, WorkerBackendHandle } from './backend/types.js';
+import { getRole, BUILT_IN_ROLES } from './roles.js';
+import { getPreset, presetNames, WORKFLOW_PRESETS } from './presets.js';
 
 /* ------------------------------------------------------------------ *
  * Spawn inputs
@@ -321,6 +323,15 @@ export class WorkerSupervisor {
 
     const deliverables = sanitizeDeliverables(params.deliverables);
     const capabilities = sanitizeCapabilities(params.capabilities);
+
+    // Role template: validates the name and merges role defaults
+    // (explicit caller values win on duplicates via Set semantics).
+    if (params.role !== undefined && params.role !== null) {
+      const role = getRole(params.role);
+      if (!role) throw new Error(`unknown role: ${JSON.stringify(params.role)} (see list_roles)`);
+      for (const d of role.defaultDeliverables) if (!deliverables.includes(d)) deliverables.push(d);
+      for (const c of role.defaultCapabilities) if (!capabilities.includes(c)) capabilities.push(c);
+    }
 
     // Dependencies (standalone tasks reference existing task ids directly).
     const dependsOn = workflowCtx ? workflowCtx.dependsOnIds : [...new Set(params.depends_on ?? [])];
@@ -968,6 +979,81 @@ export class WorkerSupervisor {
     };
   }
 
+  /* ------------------------------ roles & presets ------------------------------ */
+
+  listRoles(): Array<Record<string, unknown>> {
+    return BUILT_IN_ROLES.map((r) => ({
+      name: r.name,
+      description: r.description,
+      preferred_mode: r.preferredMode,
+      default_deliverables: r.defaultDeliverables,
+      default_capabilities: r.defaultCapabilities,
+    }));
+  }
+
+  listPresets(): Array<Record<string, unknown>> {
+    return WORKFLOW_PRESETS.map((p) => ({
+      name: p.name,
+      description: p.description,
+      workspace: p.workspace,
+      task_count: p.build('<goal>').length,
+      graph: p.build('<goal>').map((t) => ({ key: t.key, mode: t.mode, role: t.role, depends_on: t.depends_on ?? [] })),
+    }));
+  }
+
+  runWorkflowPreset(input: {
+    preset: string;
+    goal: string;
+    workspace?: WorkspaceInput | undefined;
+    budget?: WorkflowBudget | undefined;
+    failure_policy?: string | undefined;
+    options?: { dry_run?: boolean } | undefined;
+  }): Record<string, unknown> {
+    const preset = getPreset(input.preset);
+    if (!preset) {
+      throw new Error(`unknown preset: ${JSON.stringify(input.preset)} (available: ${presetNames().join(', ')})`);
+    }
+    if (!input.goal || input.goal.trim() === '') {
+      throw new Error('goal must be a non-empty string');
+    }
+    const tasks = preset.build(input.goal);
+    const workspace = input.workspace ?? (preset.workspace === 'git_worktree'
+      ? null
+      : { type: preset.workspace });
+    if (workspace === null) {
+      throw new Error(`preset ${preset.name} needs a git workspace: pass workspace.repo_path`);
+    }
+
+    if (input.options?.dry_run) {
+      return {
+        dry_run: true,
+        preset: preset.name,
+        description: preset.description,
+        workspace,
+        tasks: tasks.map((t) => ({
+          key: t.key,
+          mode: t.mode,
+          role: t.role,
+          depends_on: t.depends_on ?? [],
+          dependency_policy: t.dependency_policy ?? 'all_success',
+          deliverables: t.deliverables ?? [],
+          cache_policy: t.cache_policy ?? 'off',
+          task: t.task,
+        })),
+      };
+    }
+
+    const wf = this.createWorkflow({
+      name: `${preset.name}: ${input.goal.slice(0, 80)}`,
+      preset: preset.name,
+      tasks,
+      workspace,
+      budget: input.budget,
+      failure_policy: input.failure_policy,
+    });
+    return { preset: preset.name, ...wf };
+  }
+
   /* ------------------------------------------------------------------ */
 
   async continueWorker(workerId: string, instruction: string): Promise<{ worker_id: string; status: WorkerStatus; session_id: string | null }> {
@@ -1253,6 +1339,7 @@ export class WorkerSupervisor {
       deliverables: parseJsonArray(row.deliverables),
       capabilities: parseJsonArray(row.capabilities),
       workspaceDescription: this.workspaceDescription(row),
+      roleFragment: row.role ? (getRole(row.role)?.promptFragment ?? undefined) : undefined,
       subagentsNote,
     });
   }

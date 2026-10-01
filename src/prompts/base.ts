@@ -5,6 +5,7 @@ export interface PromptContext {
   deliverables: string[];
   capabilities: string[];
   workspaceDescription: string;
+  roleFragment?: string | undefined;
   subagentsNote?: string | undefined;
 }
 

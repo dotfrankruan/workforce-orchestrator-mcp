@@ -284,6 +284,20 @@ async function main(): Promise<void> {
       break;
     }
 
+    case 'roles': {
+      const { supervisor, store } = openSupervisor();
+      printJson(supervisor.listRoles());
+      store.close();
+      break;
+    }
+
+    case 'presets': {
+      const { supervisor, store } = openSupervisor();
+      printJson(supervisor.listPresets());
+      store.close();
+      break;
+    }
+
     case 'inspect': {
       const id = rest[0];
       if (!id) usage();
