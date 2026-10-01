@@ -79,7 +79,13 @@ export interface ResolvedDshExecutable {
  * Resolve the dsh executable without any required configuration:
  * explicit config/env → /usr/local/bin/dsh → dsh on PATH → unavailable.
  */
-export function resolveDshExecutable(config: Config, fileConfig: WorkforceFileConfig | null): ResolvedDshExecutable {
+export function resolveDshExecutable(
+  config: Config,
+  fileConfig: WorkforceFileConfig | null,
+  deps: { isExecutable?: (p: string) => boolean; which?: (cmd: string) => string | null } = {},
+): ResolvedDshExecutable {
+  const exeExists = deps.isExecutable ?? isExecutable;
+  const whichFn = deps.which ?? which;
   const fromFile = fileConfig?.backends?.dsh?.command;
   if (fromFile) return { command: fromFile, source: 'config' };
 
@@ -91,8 +97,8 @@ export function resolveDshExecutable(config: Config, fileConfig: WorkforceFileCo
   // non-default values as configured.
   if (config.dshBin !== '/usr/local/bin/dsh') return { command: config.dshBin, source: 'config' };
 
-  if (isExecutable('/usr/local/bin/dsh')) return { command: '/usr/local/bin/dsh', source: 'builtin-path' };
-  const onPath = which('dsh');
+  if (exeExists('/usr/local/bin/dsh')) return { command: '/usr/local/bin/dsh', source: 'builtin-path' };
+  const onPath = whichFn('dsh');
   if (onPath) return { command: onPath, source: 'path' };
   return { command: null, source: 'none' };
 }

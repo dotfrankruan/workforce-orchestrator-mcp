@@ -112,3 +112,27 @@ test('summarizeFinalText handles null', () => {
   assert.deepEqual(s.summary, []);
   assert.equal(s.tests.status, 'unknown');
 });
+
+test('DSH adapter: normalizeDshEvent maps wire events to WorkerEvents', async () => {
+  const { normalizeDshEvent } = await import('../../backends/events.js');
+
+  // session
+  assert.deepEqual(normalizeDshEvent(parseDshLine('{"type":"session","sessionId":"s1"}')!), [
+    { type: 'session', sessionId: 's1', cwd: undefined, offset: undefined },
+  ]);
+  // status with usage splits into status + usage
+  const norm = normalizeDshEvent(
+    parseDshLine('{"type":"status","phase":"step_end","usage":{"inputTokens":5,"outputTokens":3}}')!,
+  );
+  assert.equal(norm.length, 2);
+  assert.equal(norm[0]!.type, 'status');
+  assert.equal(norm[1]!.type, 'usage');
+  // thinking never reaches the supervisor
+  assert.deepEqual(normalizeDshEvent(parseDshLine('{"type":"thinking","text":"secret thoughts"}')!), []);
+  // malformed surfaces as such
+  assert.equal(normalizeDshEvent(parseDshLine('not json')!)[0]!.type, 'malformed');
+  // final/text/tool events map through
+  assert.equal(normalizeDshEvent(parseDshLine('{"type":"final","text":"done"}')!)[0]!.type, 'final');
+  assert.equal(normalizeDshEvent(parseDshLine('{"type":"tool_call","tool":"bash","callId":"c"}')!)[0]!.type, 'tool_call');
+  assert.equal(normalizeDshEvent(parseDshLine('{"type":"tool_result","callId":"c","status":"completed"}')!)[0]!.type, 'tool_result');
+});
