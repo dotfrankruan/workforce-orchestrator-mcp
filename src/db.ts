@@ -267,6 +267,9 @@ export interface TaskBudget {
 
 export interface WorkflowBudget {
   max_duration_seconds?: number;
+  /** Canonical: max total worker tokens (input+output+cache) across the workflow. */
+  max_worker_tokens?: number;
+  /** Deprecated alias of max_worker_tokens (kept readable for old clients). */
   max_kimi_tokens?: number;
   max_concurrent_tasks?: number;
   max_tasks?: number;
@@ -910,6 +913,19 @@ export class WorkerStore {
       | { value: string }
       | undefined;
     return row ? Number(row.value) : 0;
+  }
+
+  /** Token totals + task counts grouped by backend. */
+  backendAgg(): Array<{ backend_id: string; tasks: number; input: number; output: number; cache_read: number }> {
+    return this.db
+      .prepare(
+        `SELECT backend_id, COUNT(*) AS tasks,
+           COALESCE(SUM(input_tokens),0) AS input,
+           COALESCE(SUM(output_tokens),0) AS output,
+           COALESCE(SUM(cache_read_tokens),0) AS cache_read
+         FROM workers GROUP BY backend_id`,
+      )
+      .all() as unknown as Array<{ backend_id: string; tasks: number; input: number; output: number; cache_read: number }>;
   }
 
   tokenSumsForWorkflow(wfId: string): { input: number; output: number; cache_read: number } {

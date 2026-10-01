@@ -73,6 +73,8 @@ export interface CacheKeyInput {
   roleFragment: string | null;
   task: string;
   fingerprint: string;
+  /** Runtime backend identity — results never leak across backends. */
+  backendId?: string | undefined;
 }
 
 export function computeCacheKey(input: CacheKeyInput): string {
@@ -87,6 +89,7 @@ export function computeCacheKey(input: CacheKeyInput): string {
         rf: input.roleFragment ? crypto.createHash('sha256').update(input.roleFragment).digest('hex').slice(0, 12) : null,
         task: normalizeTaskText(input.task),
         ws: input.fingerprint,
+        backend: input.backendId ?? 'dsh',
       }),
     )
     .digest('hex');

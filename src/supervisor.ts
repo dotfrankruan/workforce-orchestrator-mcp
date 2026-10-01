@@ -773,6 +773,7 @@ export class WorkerSupervisor {
         roleFragment: params.role ? (getRole(params.role)?.promptFragment ?? null) : null,
         task: params.task,
         fingerprint,
+        backendId: backend.id,
       });
       // Persisted so finalize can write the entry even after a restart.
       this.store.addEvent(id, 'cache_key', JSON.stringify({ key, fingerprint }));
@@ -1651,6 +1652,11 @@ export class WorkerSupervisor {
         workers_reattached: this.store.metaGet('workers_reattached'),
         workers_genuinely_interrupted: this.store.metaGet('workers_genuinely_interrupted'),
       },
+      backends: this.store.backendAgg().map((b) => ({
+        backend: b.backend_id,
+        tasks: b.tasks,
+        tokens: { input: b.input, output: b.output, cache_read: b.cache_read },
+      })),
     };
   }
 
@@ -1943,13 +1949,14 @@ export class WorkerSupervisor {
     if (row.workflow_id) {
       const wf = this.store.getWorkflow(row.workflow_id);
       const wb = this.workflowBudget(wf);
-      if (wf && wb?.max_kimi_tokens) {
+      const maxWorkerTokens = wb?.max_worker_tokens ?? wb?.max_kimi_tokens; // deprecated alias
+      if (wf && maxWorkerTokens) {
         const sums = this.store.tokenSumsForWorkflow(wf.id);
         const used = sums.input + sums.output + sums.cache_read;
-        if (used > wb.max_kimi_tokens) {
-          this.store.addEvent(wf.id, 'budget', `workflow max_kimi_tokens exceeded: ${used}/${wb.max_kimi_tokens}`);
-          this.failWorkflowForBudget(wf.id, `max_kimi_tokens: ${used}/${wb.max_kimi_tokens}`);
-          return setBudgetBreach('workflow_max_kimi_tokens', wb.max_kimi_tokens, used);
+        if (used > maxWorkerTokens) {
+          this.store.addEvent(wf.id, 'budget', `workflow max_worker_tokens exceeded: ${used}/${maxWorkerTokens}`);
+          this.failWorkflowForBudget(wf.id, `max_worker_tokens: ${used}/${maxWorkerTokens}`);
+          return setBudgetBreach('workflow_max_worker_tokens', maxWorkerTokens, used);
         }
       }
     }

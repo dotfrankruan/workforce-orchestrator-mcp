@@ -84,7 +84,8 @@ test('workflow token budget: exceeding max_kimi_tokens fails the workflow', asyn
     assert.equal(bRow.status, 'budget_exceeded');
     // b started, emitted usage pushing the workflow total over budget, and
     // was terminated mid-run (best-effort, per-event granularity).
-    assert.ok(JSON.parse(bRow.error!).budget.reason.includes('kimi_tokens'));
+    // max_kimi_tokens still accepted as deprecated alias; canonical reason reported.
+    assert.ok(JSON.parse(bRow.error!).budget.reason.includes('worker_tokens'));
   } finally {
     h.cleanup();
   }
