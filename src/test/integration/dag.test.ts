@@ -277,8 +277,10 @@ test('git workflow: sequential code tasks commit onto one workflow branch', asyn
     assert.equal(done['status'], 'completed');
 
     const result = h.supervisor.workflowResult(wf.workflow_id) as Record<string, any>;
-    const branch = result['git']['branch'] as string;
-    assert.match(branch, /^kimi-worker\/wf_/);
+    const branch = result['git']['integration_branch'] as string;
+    assert.match(branch, /^kimi-workflow\/wf_/);
+    assert.equal(result['git']['tasks_integrated'], 2);
+    assert.equal(result['git']['integration_conflicts'], 0);
     assert.equal(result['git']['working_tree_clean'], true);
     // Two supervisor commits on top of base, one per task.
     const count = Number(git(['rev-list', '--count', `${base}..${branch}`], repo).trim());

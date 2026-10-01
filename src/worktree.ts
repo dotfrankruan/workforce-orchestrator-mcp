@@ -105,8 +105,8 @@ export function lastCommit(worktreePath: string): { hash: string; subject: strin
  * Git worktree metadata lives in the ORIGINAL repo's .git/worktrees/…,
  * which is outside the worker's writable sandbox — so workers cannot
  * reliably commit. The supervisor (host Node process) owns a small,
- * fixed set of git mutations: add/commit only. Never push/merge/reset/
- * clean/rebase.
+ * fixed set of git mutations: status/diff/add/commit/rev-parse/log/
+ * cherry-pick/worktree/branch. Never push/merge/reset/clean/rebase.
  * ------------------------------------------------------------------ */
 
 export function currentBranch(worktreePath: string): string | null {
@@ -161,4 +161,60 @@ export function supervisorCommitAll(worktreePath: string, message: string): Supe
       return { ok: false, error: (second as Error).message || (first as Error).message };
     }
   }
+}
+
+/* ------------------------------------------------------------------ *
+ * Workflow integration ops (supervisor-only, serialized per workflow).
+ * ------------------------------------------------------------------ */
+
+/** Commit shas in `from..HEAD`, oldest first. */
+export function revListRange(worktreePath: string, from: string): string[] {
+  const out = tryGit(['rev-list', '--reverse', `${from}..HEAD`], worktreePath);
+  if (!out) return [];
+  return out.split('\n').map((l) => l.trim()).filter(Boolean);
+}
+
+export interface CherryPickResult {
+  ok: boolean;
+  /** Conflicted paths when the pick failed due to conflicts. */
+  conflictFiles: string[];
+  error?: string;
+}
+
+/**
+ * Cherry-pick ONE validated commit into the integration worktree.
+ * On conflict: capture conflicted paths, immediately `cherry-pick --abort`
+ * (integration branch returns to its pre-pick clean state), then report.
+ * Never auto-resolves with --ours/--theirs.
+ */
+export function cherryPickCommit(worktreePath: string, sha: string): CherryPickResult {
+  if (!/^[0-9a-f]{7,40}$/i.test(sha)) {
+    return { ok: false, conflictFiles: [], error: `invalid commit sha: ${sha}` };
+  }
+  try {
+    runGit(['cherry-pick', sha], worktreePath);
+    return { ok: true, conflictFiles: [] };
+  } catch (err) {
+    const conflictFiles = (tryGit(['diff', '--name-only', '--diff-filter=U'], worktreePath) ?? '')
+      .split('\n')
+      .map((l) => l.trim())
+      .filter(Boolean);
+    // Always abort back to the pre-pick clean state.
+    tryGit(['cherry-pick', '--abort'], worktreePath);
+    return {
+      ok: false,
+      conflictFiles,
+      error: (err as Error).message.slice(0, 500),
+    };
+  }
+}
+
+/** Create a task worktree+branch rooted at an explicit commit sha. */
+export function createWorktreeAtCommit(
+  repoRoot: string,
+  worktreePath: string,
+  branch: string,
+  commitSha: string,
+): void {
+  runGit(['worktree', 'add', '-b', branch, worktreePath, commitSha], repoRoot);
 }

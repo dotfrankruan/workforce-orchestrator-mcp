@@ -36,6 +36,9 @@ import {
   diffStat,
   diffFull,
   lastCommit,
+  revListRange,
+  cherryPickCommit,
+  createWorktreeAtCommit,
 } from './worktree.js';
 import { buildContinuePrompt } from './prompt.js';
 import { buildModePrompt } from './prompts/index.js';
@@ -231,6 +234,18 @@ export class WorkerSupervisor {
         this.wfDeadlineTimers.set(wf.id, timer);
       }
       this.updateWorkflowState(wf.id);
+      // Integration catch-up: tasks that completed but were never integrated
+      // (e.g. server stopped between finalize and integration).
+      for (const t of this.store.workersInWorkflow(wf.id)) {
+        if (
+          (t.status === 'completed' || t.status === 'completed_uncommitted') &&
+          t.integration_status === 'pending' &&
+          t.workspace_type === 'git_worktree' &&
+          fs.existsSync(t.worktree_path)
+        ) {
+          void this.integrateTask(t.id);
+        }
+      }
     }
     this.schedule();
   }
@@ -375,18 +390,39 @@ export class WorkerSupervisor {
     while (this.store.getWorker(id) !== null) id = newWorkerId();
 
     let plan: PlannedWorkspace;
+    let taskBranch: string | null = null;
+    let integrationStatus: string | null = null;
     if (workflowCtx) {
-      // Shared workflow workspace; per-task logs under the workflow dir.
       const wf = workflowCtx.workflow;
-      plan = {
-        type: wf.workspace_type as WorkspaceType,
-        cwd: wf.workspace_path,
-        artifactRoot: wf.workspace_path,
-        logDir: path.join(wf.log_dir, 'tasks', id),
-        repoPath: wf.repo_path,
-        baseRef: wf.base_ref,
-        branch: wf.branch,
-      };
+      if (wf.workspace_type === 'git_worktree') {
+        // Parallel Git isolation: every workflow task gets its OWN worktree
+        // and branch (kimi-task/<id>), materialized lazily at run start from
+        // the then-current integration HEAD. The workflow-level workspace is
+        // the integration worktree (kimi-workflow/<wf>) — workers never touch
+        // it directly.
+        plan = {
+          type: 'git_worktree',
+          cwd: path.join(wf.log_dir, 'tasks', id, 'worktree'),
+          artifactRoot: path.join(wf.log_dir, 'tasks', id, 'worktree'),
+          logDir: path.join(wf.log_dir, 'tasks', id),
+          repoPath: wf.repo_path,
+          baseRef: wf.base_ref, // refined to the snapshot commit at materialization
+          branch: '',
+        };
+        taskBranch = `kimi-task/${id}`;
+        integrationStatus = 'pending';
+      } else {
+        // Non-git workflows: shared workspace (unchanged semantics).
+        plan = {
+          type: wf.workspace_type as WorkspaceType,
+          cwd: wf.workspace_path,
+          artifactRoot: wf.workspace_path,
+          logDir: path.join(wf.log_dir, 'tasks', id),
+          repoPath: wf.repo_path,
+          baseRef: wf.base_ref,
+          branch: wf.branch,
+        };
+      }
     } else {
       plan = planWorkspace(resolved.type, wsInput, { workerRoot: this.config.workerRoot, workerId: id });
       prepareWorkspace(plan);
@@ -419,6 +455,12 @@ export class WorkerSupervisor {
       retry_on: JSON.stringify(retryOn),
       initialStatus: dependsOn.length > 0 ? 'waiting_dependencies' : 'queued',
     });
+    if (taskBranch || integrationStatus) {
+      this.store.updateWorker(id, {
+        ...(taskBranch ? { task_branch: taskBranch } : {}),
+        ...(integrationStatus ? { integration_status: integrationStatus } : {}),
+      });
+    }
     this.store.addEvent(
       id,
       'spawn',
@@ -1049,14 +1091,51 @@ export class WorkerSupervisor {
       },
       git: wf.workspace_type === 'git_worktree'
         ? {
-            branch: wf.branch,
+            integration_branch: wf.branch,
             repo_path: wf.repo_path,
             base_ref: wf.base_ref,
-            head: fs.existsSync(wf.workspace_path) ? currentHead(wf.workspace_path) : null,
+            integration_head: fs.existsSync(wf.workspace_path) ? currentHead(wf.workspace_path) : null,
             working_tree_clean: fs.existsSync(wf.workspace_path) ? statusPorcelain(wf.workspace_path) === '' : null,
+            tasks_integrated: rows.filter((r) => r.integration_status === 'integrated').length,
+            integration_conflicts: rows.filter((r) => r.integration_status === 'conflict').length,
           }
         : null,
       warnings,
+    };
+  }
+
+  /** git diff of a workflow: base ref … integration HEAD. stat-only by default. */
+  workflowDiff(wfId: string, opts: { stat_only?: boolean | undefined; path?: string | undefined }): Record<string, unknown> {
+    const wf = this.store.getWorkflow(wfId);
+    if (!wf) throw new Error(`unknown workflow: ${wfId}`);
+    if (wf.workspace_type !== 'git_worktree') {
+      throw new Error(`workflow ${wfId} does not use a git worktree (workspace=${wf.workspace_type})`);
+    }
+    if (!fs.existsSync(wf.workspace_path)) {
+      throw new Error(`integration worktree no longer exists for workflow ${wfId}`);
+    }
+    const statOnly = opts.stat_only ?? true;
+    if (opts.path && (opts.path.includes('..') || path.isAbsolute(opts.path))) {
+      throw new Error('diff path must be a relative path inside the repo');
+    }
+    if (statOnly) {
+      return {
+        workflow_id: wfId,
+        stat_only: true,
+        base_ref: wf.base_ref,
+        integration_branch: wf.branch,
+        diff_stat: redactSecrets(diffStat(wf.workspace_path, wf.base_ref, opts.path).trim()),
+      };
+    }
+    const full = diffFull(wf.workspace_path, wf.base_ref, opts.path);
+    const t = truncateUtf8(redactSecrets(full), this.config.diffMaxBytes);
+    return {
+      workflow_id: wfId,
+      stat_only: false,
+      base_ref: wf.base_ref,
+      integration_branch: wf.branch,
+      diff: t.text,
+      truncated: t.truncated,
     };
   }
 
@@ -1287,9 +1366,41 @@ export class WorkerSupervisor {
     if (!row.session_id) {
       throw new Error(`worker ${workerId} has no recorded dsh session id; cannot resume`);
     }
-    if (!fs.existsSync(row.worktree_path)) {
+
+    // Continue after integration: the task's old worktree branched from an
+    // outdated snapshot. Create a continuation worktree from the CURRENT
+    // workflow integration HEAD (which may include siblings' changes), on a
+    // new branch, with a fresh session (a dsh session is bound to its cwd —
+    // correctness beats session reuse).
+    let resumeSession = true;
+    if (
+      row.workflow_id &&
+      row.workspace_type === 'git_worktree' &&
+      (row.integration_status === 'integrated' || row.integration_status === 'skipped' || row.integration_status === 'conflict')
+    ) {
+      const wf = this.store.getWorkflow(row.workflow_id);
+      if (!wf) throw new Error(`workflow ${row.workflow_id} missing`);
+      const integrationHead = currentHead(wf.workspace_path);
+      if (!integrationHead) throw new Error('integration worktree has no HEAD');
+      const n = row.continue_count + 1;
+      const newBranch = `kimi-task/${row.id}-r${n}`;
+      const newPath = path.join(wf.log_dir, 'tasks', row.id, `worktree-r${n}`);
+      createWorktreeAtCommit(wf.repo_path, newPath, newBranch, integrationHead);
+      this.store.updateWorker(workerId, {
+        worktree_path: newPath,
+        task_branch: newBranch,
+        base_ref: integrationHead,
+        workspace_base_commit: integrationHead,
+        session_id: null,
+        integration_status: 'pending',
+      });
+      this.store.addEvent(workerId, 'continue_workspace', `fresh snapshot from integration HEAD ${integrationHead.slice(0, 12)} (new session)`);
+      resumeSession = false;
+    } else if (!fs.existsSync(row.worktree_path)) {
       throw new Error(`worker ${workerId} workspace no longer exists: ${row.worktree_path}`);
     }
+
+    const updated = this.get(workerId);
     this.store.updateWorker(workerId, {
       status: 'queued',
       error: null,
@@ -1297,7 +1408,7 @@ export class WorkerSupervisor {
     });
     this.store.addEvent(workerId, 'continue', instruction.slice(0, MAX_EVENT_SUMMARY));
     this.schedule();
-    return { worker_id: workerId, status: 'queued', session_id: row.session_id };
+    return { worker_id: workerId, status: 'queued', session_id: resumeSession ? updated.session_id : null };
   }
 
   async cancelWorker(workerId: string): Promise<{ worker_id: string; status: WorkerStatus }> {
@@ -1394,9 +1505,27 @@ export class WorkerSupervisor {
         this.blockTask(row, deps.map((d, i) => ({ task_id: d, status: depRows[i]?.status ?? 'missing' })));
         continue;
       }
-      const statuses = depRows.map((d) => (d as WorkerRow).status);
+      const typedDeps = depRows as WorkerRow[];
+      const statuses = typedDeps.map((d) => d.status);
       const allTerminal = statuses.every((s) => isTerminal(s));
       if (!allTerminal) continue; // still waiting
+
+      // Git-workflow gating: downstream tasks must only observe INTEGRATED
+      // dependency results. A dependency with integration=conflict keeps
+      // dependents waiting (not blocked) until the conflict is resolved.
+      if (row.workflow_id) {
+        const wf = this.store.getWorkflow(row.workflow_id);
+        if (wf?.workspace_type === 'git_worktree') {
+          const integrated = (d: WorkerRow) =>
+            d.integration_status === 'integrated' || d.integration_status === 'skipped';
+          if (typedDeps.some((d) => d.integration_status === 'conflict' || d.integration_status === 'integrating')) {
+            continue; // keep waiting; conflict resolution is a Codex/human decision
+          }
+          if (typedDeps.some((d) => d.status === 'completed' && !integrated(d))) {
+            continue; // completed but integration pending
+          }
+        }
+      }
 
       const allSuccess = statuses.every((s) => s === 'completed');
       const failedDeps = deps
@@ -1548,8 +1677,11 @@ export class WorkerSupervisor {
     this.notifyWaiters(wfId);
   }
 
-  private buildPrompt(row: WorkerRow, isResume: boolean): string {
-    if (isResume) return buildContinuePrompt(this.peekContinueInstruction(row));
+  private buildPrompt(row: WorkerRow): string {
+    // Continuation runs always get the latest continue instruction —
+    // regardless of whether the dsh session is resumed (same cwd) or fresh
+    // (workspace refreshed to the current integration HEAD).
+    if (row.continue_count > 0) return buildContinuePrompt(this.peekContinueInstruction(row));
     const subagentsNote =
       this.config.enableDshSubagents && (row.mode === 'research' || row.mode === 'general')
         ? `You may delegate independent sub-investigations to subagents when your runtime supports it (depth ≤ ${this.config.maxSubagentDepth}, at most ${this.config.maxSubagentsPerTask} subagents). Keep delegation minimal and integrate the results yourself.`
@@ -1568,8 +1700,22 @@ export class WorkerSupervisor {
     row: WorkerRow,
     opts: { resumeSessionId: string | null },
   ): void {
+    // Materialize the per-task worktree for git-workflow tasks: branch from
+    // the CURRENT integration HEAD (all integrated dependencies included).
+    // This snapshot stays immutable for the run's whole lifetime.
+    if (row.workflow_id && row.workspace_type === 'git_worktree' && !fs.existsSync(row.worktree_path)) {
+      const wf = this.store.getWorkflow(row.workflow_id);
+      if (!wf) throw new Error(`workflow ${row.workflow_id} missing for task ${row.id}`);
+      const integrationHead = currentHead(wf.workspace_path);
+      if (!integrationHead) throw new Error(`integration worktree has no HEAD: ${wf.workspace_path}`);
+      createWorktreeAtCommit(wf.repo_path, row.worktree_path, row.task_branch ?? `kimi-task/${row.id}`, integrationHead);
+      this.store.updateWorker(row.id, { workspace_base_commit: integrationHead, base_ref: integrationHead });
+      this.store.addEvent(row.id, 'workspace', `snapshot=${integrationHead.slice(0, 12)} branch=${row.task_branch}`);
+      row = this.get(row.id);
+    }
+
     const isResume = opts.resumeSessionId !== null;
-    const prompt = this.buildPrompt(row, isResume);
+    const prompt = this.buildPrompt(row);
 
     const stdoutPath = path.join(row.log_dir, 'stdout.jsonl');
     const stderrPath = path.join(row.log_dir, 'stderr.log');
@@ -1871,8 +2017,9 @@ export class WorkerSupervisor {
     let commitError: string | null = null;
 
     const branchNow = currentBranch(wt);
-    if (branchNow !== row.branch) {
-      commitError = `worker left worktree on unexpected ref ${branchNow ?? '(detached)'} (expected ${row.branch}); refusing to commit`;
+    const expectedBranch = row.task_branch ?? row.branch;
+    if (branchNow !== expectedBranch) {
+      commitError = `worker left worktree on unexpected ref ${branchNow ?? '(detached)'} (expected ${expectedBranch}); refusing to commit`;
     } else if (statusPorcelain(wt) !== '') {
       const suggested = this.suggestedCommitMessage(finalText);
       const message = suggested ?? this.fallbackCommitMessage(row, workerCommitted);
@@ -2086,8 +2233,112 @@ export class WorkerSupervisor {
       });
     }
 
+    // Git-workflow tasks: record this run's commits, then serialize
+    // integration into the workflow branch BEFORE waiters wake — a task is
+    // only "done" for dependency purposes once its commits are integrated.
+    if (
+      (provisional === 'completed' || provisional === 'completed_uncommitted') &&
+      row.workspace_type === 'git_worktree' &&
+      row.workflow_id &&
+      run.headBeforeRun
+    ) {
+      const newCommits = revListRange(row.worktree_path, run.headBeforeRun);
+      if (newCommits.length > 0) {
+        const prev = parseJsonArray(row.task_commits);
+        this.store.updateWorker(workerId, { task_commits: JSON.stringify([...prev, ...newCommits]) });
+      }
+      await this.integrateTask(workerId);
+    }
+
     finishTerminal(provisional, provisionalError);
     this.maybeWriteCache(workerId, provisional);
+  }
+
+  /* -------------------- serialized workflow integration -------------------- */
+
+  private integrationLocks = new Map<string, Promise<unknown>>();
+
+  /** Lightweight per-workflow async mutex: integration is never concurrent. */
+  private withIntegrationLock<T>(wfId: string, fn: () => Promise<T> | T): Promise<T> {
+    const prev = this.integrationLocks.get(wfId) ?? Promise.resolve();
+    const next = prev.then(fn, fn);
+    this.integrationLocks.set(
+      wfId,
+      next.then(
+        () => undefined,
+        () => undefined,
+      ),
+    );
+    return next;
+  }
+
+  /**
+   * Cherry-pick the task's not-yet-integrated commits onto the workflow
+   * integration branch. Conflicts abort immediately (clean state restored)
+   * and are surfaced — never auto-resolved.
+   */
+  private async integrateTask(workerId: string): Promise<void> {
+    const row = this.get(workerId);
+    if (!row.workflow_id || row.workspace_type !== 'git_worktree') return;
+    if (row.integration_status === 'integrated' || row.integration_status === 'skipped') return;
+    const wf = this.store.getWorkflow(row.workflow_id);
+    if (!wf) return;
+    const integrationWt = wf.workspace_path;
+    if (!fs.existsSync(integrationWt)) {
+      this.store.updateWorker(workerId, {
+        integration_status: 'conflict',
+        integration_error: JSON.stringify({ error: 'integration worktree missing' }),
+      });
+      return;
+    }
+
+    await this.withIntegrationLock(wf.id, () => {
+      const baseCommit = row.workspace_base_commit;
+      if (!baseCommit) {
+        this.store.updateWorker(workerId, { integration_status: 'skipped' });
+        return;
+      }
+      const all = revListRange(row.worktree_path, baseCommit);
+      const already = new Set(parseJsonArray(row.integrated_commits));
+      const pending = all.filter((s) => !already.has(s));
+      if (pending.length === 0) {
+        this.store.updateWorker(workerId, { integration_status: 'skipped' });
+        this.store.addEvent(workerId, 'integrate', 'no new commits → skipped');
+        return;
+      }
+
+      this.store.updateWorker(workerId, { integration_status: 'integrating' });
+      const picked: string[] = [];
+      for (const sha of pending) {
+        const res = cherryPickCommit(integrationWt, sha);
+        if (!res.ok) {
+          // Aborted back to clean state inside cherryPickCommit. Picks that
+          // already succeeded in this batch ARE on the branch — record them
+          // so a later retry never re-picks them.
+          this.store.updateWorker(workerId, {
+            integration_status: 'conflict',
+            integrated_commits: JSON.stringify([...already, ...picked]),
+            integration_error: JSON.stringify({
+              conflicting_commits: [sha],
+              remaining_commits: pending.slice(pending.indexOf(sha) + 1),
+              files: res.conflictFiles,
+              error: res.error,
+            }),
+          });
+          this.store.addEvent(workerId, 'integrate_conflict', `commit ${sha.slice(0, 7)} conflicts on ${res.conflictFiles.join(', ') || 'unknown files'}`);
+          this.store.addEvent(wf.id, 'workflow', `integration conflict in task ${row.task_key ?? row.id}`);
+          return;
+        }
+        picked.push(sha);
+      }
+
+      this.store.updateWorker(workerId, {
+        integration_status: 'integrated',
+        integrated_commits: JSON.stringify([...already, ...picked]),
+        integration_error: null,
+      });
+      this.store.addEvent(workerId, 'integrate', `integrated ${picked.length} commit(s) into ${wf.branch}`);
+    });
   }
 
   /** Write the artifact-cache entry after a successful cacheable run. */
@@ -2297,10 +2548,31 @@ export class WorkerSupervisor {
         ? (lastCommit(row.worktree_path)?.subject ?? null)
         : null;
       out['tests'] = summary.tests;
-      out['git'] = this.gitInfo(row);
+      out['git'] = {
+        ...this.gitInfo(row),
+        task_branch: row.task_branch,
+        workspace_base_commit: row.workspace_base_commit,
+        commits: parseJsonArray(row.task_commits),
+        integration: row.workflow_id
+          ? {
+              status: row.integration_status,
+              error: row.integration_error ? JSON.parse(row.integration_error) : null,
+              integrated_commits: parseJsonArray(row.integrated_commits),
+            }
+          : null,
+      };
     }
     if (row.error) out['error'] = redactSecrets(row.error);
     if (row.exit_code !== null) out['exit_code'] = row.exit_code;
+    // Backend-exhaustion handoff metadata (Part 26): facts only, no guessing.
+    const retryOn = parseJsonArray(row.retry_on);
+    const retriable = (s: string) => retryOn.includes(s);
+    out['attempts'] = row.attempt;
+    out['retries_exhausted'] =
+      (row.status === 'failed' || row.status === 'timeout') &&
+      retriable(row.status) &&
+      row.attempt >= row.max_attempts;
+    if (isTerminal(row.status)) out['work_preserved'] = fs.existsSync(row.worktree_path);
     return out;
   }
 

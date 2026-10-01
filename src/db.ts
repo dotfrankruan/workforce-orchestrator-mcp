@@ -103,6 +103,13 @@ export interface WorkerRow {
   attempt: number;
   max_attempts: number;
   retry_on: string; // JSON array of statuses
+  // v4: parallel git isolation & integration
+  task_branch: string | null; // kimi-task/<id> branch for git-workflow tasks
+  workspace_base_commit: string | null; // immutable snapshot commit the task started from
+  task_commits: string; // JSON array of commit shas created by this task (all runs)
+  integration_status: string | null; // null | pending | integrating | integrated | conflict | skipped
+  integration_error: string | null; // JSON {conflicting_commits, files}
+  integrated_commits: string; // JSON array of shas already cherry-picked
 }
 
 export interface WorkflowRow {
@@ -180,6 +187,15 @@ export interface WorkerPatch {
   acceptance?: string;
   attempt?: number;
   max_attempts?: number;
+  task_branch?: string | null;
+  workspace_base_commit?: string | null;
+  task_commits?: string;
+  integration_status?: string | null;
+  integration_error?: string | null;
+  integrated_commits?: string;
+  worktree_path?: string;
+  base_ref?: string;
+  branch?: string;
 }
 
 export interface NewWorker {
@@ -410,7 +426,17 @@ const WORKERS_V3_COLUMNS: Array<[string, string]> = [
   ['retry_on', `ALTER TABLE workers ADD COLUMN retry_on TEXT NOT NULL DEFAULT '["failed","timeout"]'`],
 ];
 
-const CURRENT_SCHEMA_VERSION = 3;
+/** Columns added to workers in schema v4 (parallel git isolation & integration). */
+const WORKERS_V4_COLUMNS: Array<[string, string]> = [
+  ['task_branch', `ALTER TABLE workers ADD COLUMN task_branch TEXT`],
+  ['workspace_base_commit', `ALTER TABLE workers ADD COLUMN workspace_base_commit TEXT`],
+  ['task_commits', `ALTER TABLE workers ADD COLUMN task_commits TEXT NOT NULL DEFAULT '[]'`],
+  ['integration_status', `ALTER TABLE workers ADD COLUMN integration_status TEXT`],
+  ['integration_error', `ALTER TABLE workers ADD COLUMN integration_error TEXT`],
+  ['integrated_commits', `ALTER TABLE workers ADD COLUMN integrated_commits TEXT NOT NULL DEFAULT '[]'`],
+];
+
+const CURRENT_SCHEMA_VERSION = 4;
 
 const ALL_COLUMNS = [
   'id', 'repo_path', 'base_ref', 'branch', 'worktree_path', 'log_dir', 'status', 'task',
@@ -421,6 +447,8 @@ const ALL_COLUMNS = [
   'commit_followup_used', 'timeout_seconds',
   'workflow_id', 'task_key', 'depends_on', 'dependency_policy', 'role', 'priority',
   'cache_policy', 'execution_class', 'acceptance', 'budget', 'attempt', 'max_attempts', 'retry_on',
+  'task_branch', 'workspace_base_commit', 'task_commits', 'integration_status',
+  'integration_error', 'integrated_commits',
 ] as const;
 
 function rowToWorker(row: Record<string, unknown>): WorkerRow {
@@ -489,6 +517,13 @@ function migrate(db: DatabaseSync): void {
     }
     db.exec(SCHEMA_V3_TABLES);
     version = 3;
+  }
+
+  if (version < 4) {
+    for (const [col, ddl] of WORKERS_V4_COLUMNS) {
+      if (!columnExists(db, 'workers', col)) db.exec(ddl);
+    }
+    version = 4;
   }
 
   db.exec(`CREATE TABLE IF NOT EXISTS schema_meta (id INTEGER PRIMARY KEY CHECK (id = 1), version INTEGER NOT NULL)`);

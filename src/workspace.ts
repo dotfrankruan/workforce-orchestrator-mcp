@@ -176,14 +176,17 @@ export function planWorkflowWorkspace(
     if (!input.repo_path) throw new Error('workspace.repo_path is required for git_worktree workflow');
     const { repoRoot } = validateRepoPath(input.repo_path);
     const baseSha = resolveRef(repoRoot, input.base_ref ?? 'HEAD');
+    // The workflow-level workspace is the INTEGRATION worktree (branch
+    // kimi-workflow/<id>). Every task gets its own worktree+branch under
+    // logDir/tasks/<taskId>/ — workers never touch the integration worktree.
     return {
       type,
-      cwd: path.join(logDir, 'worktree'),
-      artifactRoot: path.join(logDir, 'worktree'),
+      cwd: path.join(logDir, 'integration', 'worktree'),
+      artifactRoot: path.join(logDir, 'integration', 'worktree'),
       logDir,
       repoPath: repoRoot,
       baseRef: baseSha,
-      branch: `kimi-worker/${workflowId}`,
+      branch: `kimi-workflow/${workflowId}`,
     };
   }
   if (type === 'directory') {
