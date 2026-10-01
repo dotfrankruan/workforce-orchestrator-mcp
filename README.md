@@ -1,10 +1,80 @@
 # Kimi Workforce MCP
 
-MCP server that lets **Codex** act as planner / architect / reviewer and delegate
-many kinds of execution work to **DeepSeek Harness headless** workers running
-**Kimi K3** — coding in isolated git worktrees, research, data analysis, docs,
-file operations, ops diagnostics and code review.
+MCP server that turns **Codex** (planner / architect / reviewer) into an
+orchestrator over **Kimi K3 execution workers** (DeepSeek Harness headless) —
+task DAGs, workflows, budgets, role templates, acceptance tracking, metrics,
+and an artifact cache.
 
+**Codex thinks. Kimi executes. The orchestrator schedules. The supervisor owns state and Git. Humans retain final control.**
+
+## What's new in v4
+
+- **Task DAG**: `depends_on` + `dependency_policy` (`all_success` /
+  `all_terminal`), deterministic cycle detection, `waiting_dependencies`
+  (pre-queue, no concurrency slot), `blocked` terminal state with `blocked_by`.
+- **Workflows**: `create_workflow` (key-based DAG; one **shared workspace**;
+  one shared branch for git workflows), `get_workflow` (transparent plan),
+  `list_workflows`, `wait_workflow` (event-driven), `cancel_workflow`,
+  `get_workflow_result` (structured aggregate — never LLM-summarized).
+- **Failure policies**: `stop_dependents` (default) / `continue` /
+  `cancel_remaining`.
+- **Budgets**: per-task (`max_duration_seconds`, token caps, `max_tool_calls`,
+  `max_iterations`) and per-workflow (`max_kimi_tokens`, `max_duration_seconds`,
+  `max_concurrent_tasks`, `max_tasks`). Breach → terminal `budget_exceeded`;
+  best-effort per-event granularity, not hard accounting.
+- **Retries**: `retry: {max_attempts (≤5), retry_on}`; fresh session per
+  attempt; never retries cancelled/budget_exceeded; intermediate failures do
+  not wake waiters; attempts persisted in `task_attempts`.
+- **Roles** (8 built-in): implementer, tester, researcher, reviewer,
+  docs_writer, data_analyst, debugger, ops_analyst — prompt fragments +
+  default deliverables/capabilities. Role ≠ mode.
+- **Presets** (5 built-in): `bug_fix`, `feature_development`,
+  `quality_audit`, `research_report`, `data_analysis` via
+  `run_workflow_preset` (`options.dry_run` shows the expanded plan).
+- **Acceptance**: `review_task_result` (accepted / rejected /
+  needs_revision) — separate from execution status; `needs_revision` never
+  auto-restarts the worker.
+- **Metrics**: `get_task_metrics`, `get_workflow_metrics`,
+  `get_system_metrics` (acceptance/revision/failure rates by mode+role,
+  token totals, cache stats — pure SQL aggregation, no log scanning).
+- **Artifact cache** (opt-in `cache_policy`): key = mode + role + normalized
+  task + workspace fingerprint (git HEAD / dirty diff / directory listing) +
+  prompt & schema versions. Hits reuse artifacts without a new DSH session.
+
+```
+                         Human
+                           │
+                           ▼
+                      Codex Root
+                planner / integrator
+                           │
+          ┌────────────────┴────────────────┐
+          │                                 │
+   Native Codex Subagents             Kimi Workforce
+ high-cognition reviewers                   │
+                                            ▼
+                                  Workflow Orchestrator
+                                            │
+                                 dependency scheduler
+                                            │
+                         ┌──────────────────┼─────────────────┐
+                         ▼                  ▼                 ▼
+                     Research           Implement          Test
+                       K3                  K3                K3
+                         │                  │                 │
+                         └──────────────────┼─────────────────┘
+                                            ▼
+                                          Review
+                                            │
+                                            ▼
+                                  Supervisor Git finalize
+                                            │
+                                            ▼
+                                      artifacts/result
+                                            │
+                                            ▼
+                                          Codex
+```
 ```
                    Codex
             planner / reviewer
@@ -111,6 +181,20 @@ KIMI_WORKER_ROOT = "~/.kimi-workers"
 ```
 
 ### MCP tools
+
+**Orchestration API (v4)**
+
+| Tool | Purpose |
+|---|---|
+| `create_workflow` | Key-based task DAG; shared workspace; budget + failure_policy; cycles rejected. |
+| `run_workflow_preset` | Expand a built-in preset around a goal and start it (`options.dry_run` = plan only). |
+| `list_presets` / `list_roles` | Built-in workflow presets and role templates. |
+| `get_workflow` / `list_workflows` | Transparent plan + live status. |
+| `wait_workflow` | Event-driven wait for workflow terminal state. |
+| `cancel_workflow` | Cancel all non-terminal tasks; preserves workspaces/artifacts. |
+| `get_workflow_result` | Compact aggregate: per-task outcomes, artifacts, metrics, warnings. |
+| `review_task_result` | Record acceptance (accepted/rejected/needs_revision). |
+| `get_task_metrics` / `get_workflow_metrics` / `get_system_metrics` | Objective counters and quality stats. |
 
 **Efficient waiting (new)**
 
@@ -353,10 +437,11 @@ queued ──► starting ──► running ──► completed
   shape.
 - Task ids share the original `wk_xxxxxxxx` id space — every new tool accepts
   ids created by old tools and vice versa.
-- Existing SQLite databases **migrate automatically** (schema_meta v1→v2:
-  adds `mode`, `workspace_type`, `deliverables`, `capabilities`,
-  `deliverables_missing` columns and the `artifacts` table). Pre-upgrade rows
-  read as `mode=code`, `workspace_type=git_worktree`. No manual migration, no
+- Existing SQLite databases **migrate automatically** (schema_meta v1→v2→v3:
+  v2 adds mode/workspace/deliverables/artifacts; v3 adds orchestration columns
+  on workers plus workflows/workflow_tasks/task_attempts/task_reviews/
+  artifact_cache tables). Pre-upgrade rows read as `mode=code`,
+  `workspace_type=git_worktree`, `workflow_id=null`. No manual migration, no
   data loss.
 
 ## Configuration
@@ -403,6 +488,13 @@ node dist/cli.js usage <id>
 node dist/cli.js logs <id> [--lines N]
 node dist/cli.js diff <id> [--full]
 node dist/cli.js cancel <id>
+node dist/cli.js workflows             # list workflows
+node dist/cli.js workflow <id>         # ASCII DAG with status icons
+node dist/cli.js workflow-wait <id> [--timeout S]
+node dist/cli.js workflow-cancel <id>
+node dist/cli.js review-task <id> <accepted|rejected|needs_revision> [--feedback "..."]
+node dist/cli.js task-metrics <id> | workflow-metrics <id> | metrics
+node dist/cli.js roles | presets | cache-stats
 ```
 
 Smoke / e2e scripts:
@@ -448,12 +540,18 @@ node scripts/wait-e2e.mjs                      # real parallel wait E2E (two liv
 ## Known limitations
 
 - Live-pid workers lose supervision across a server restart → `interrupted`
-  (workspace/artifacts/logs remain).
+  (workspace/artifacts/logs remain); workflows recompute terminal state on
+  restart and duration budgets re-arm.
+- Token budgets are best-effort (checked per DSH status/tool event); a run can
+  overshoot within one step. Not hard accounting.
 - Test pass/fail in compact results is heuristic (from the final report); git
   facts and deliverables are verified directly.
 - Directory-workspace artifact discovery is mtime-based (files touched since
   task start); pre-existing files are not indexed.
 - Capabilities are advisory (prompt-level), not a hard sandbox.
-- Subagent support is config/documentation only; DSH manages the actual
-  subagents when enabled.
+- Cache is opt-in and only for dependency-free tasks; a cache hit reuses
+  artifact files and does not create a new session.
+- Subagent support is config/documentation only (DSH manages subagents).
+- Priority scheduling is simple (high/normal/low then FIFO); no fairness or
+  preemption.
 - No worktree/workspace garbage collection (manual, by design).

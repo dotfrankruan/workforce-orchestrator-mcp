@@ -125,6 +125,17 @@ Usage:
   kimi-worker-mcp diff <worker-id> [--full]
                                         Show worker diff stat (or full diff)
   kimi-worker-mcp cancel <worker-id>    Cancel a running worker
+  kimi-worker-mcp workflows             List workflows
+  kimi-worker-mcp workflow <wf-id>      Show workflow DAG (ASCII)
+  kimi-worker-mcp workflow-wait <wf-id> [--timeout S]
+  kimi-worker-mcp workflow-cancel <wf-id>
+  kimi-worker-mcp review-task <id> <accepted|rejected|needs_revision> [--feedback "..."]
+  kimi-worker-mcp task-metrics <id>     Per-task metrics
+  kimi-worker-mcp workflow-metrics <wf-id>
+  kimi-worker-mcp metrics               System-wide metrics
+  kimi-worker-mcp roles                 List role templates
+  kimi-worker-mcp presets               List workflow presets
+  kimi-worker-mcp cache-stats           Artifact cache stats
 
 Configuration (environment variables):
   KIMI_WORKER_DSH_BIN         dsh binary path (default /usr/local/bin/dsh)

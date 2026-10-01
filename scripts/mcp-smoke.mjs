@@ -54,7 +54,7 @@ function notify(method, params = {}) {
 }
 
 const tool = (name, args) =>
-  request('tools/call', { name, arguments: args }).then((r) => {
+  request('tools/call', { name, arguments: args ?? {} }).then((r) => {
     const text = r.result?.content?.[0]?.text;
     if (r.result?.isError) throw new Error(`${name}: ${text}`);
     return text ? JSON.parse(text) : r.result;
@@ -137,6 +137,29 @@ try {
 
   const single = await tool('wait_task', { task_id: ids[0], timeout_seconds: 10 });
   console.log('✓ wait_task (already terminal):', single.wait.completed === true && single.wait.waited_ms < 2000 ? 'immediate' : 'slow', '| has result:', Boolean(single.result));
+
+  // Workflow orchestration (fake backend).
+  const wfx = await tool('create_workflow', {
+    name: 'smoke-wf',
+    tasks: [
+      { key: 'a', task: 'smoke A', mode: 'general', role: 'researcher' },
+      { key: 'b', task: 'smoke B', mode: 'general', depends_on: ['a'] },
+    ],
+  });
+  console.log('✓ create_workflow:', wfx.workflow_id, JSON.stringify(wfx.tasks));
+  const wfDone = await tool('wait_workflow', { workflow_id: wfx.workflow_id, timeout_seconds: 60 });
+  console.log('✓ wait_workflow:', wfDone.status, '| progress:', JSON.stringify(wfDone.progress));
+  const wfRes = await tool('get_workflow_result', { workflow_id: wfx.workflow_id });
+  console.log('✓ get_workflow_result: tasks', JSON.stringify(wfRes.tasks), '| warnings:', wfRes.warnings.length);
+  const review = await tool('review_task_result', { task_id: wfx.tasks.a, decision: 'accepted', feedback: 'smoke' });
+  console.log('✓ review_task_result:', review.acceptance);
+  const roles = await tool('list_roles');
+  const presets = await tool('list_presets');
+  console.log('✓ list_roles:', roles.roles.length, '| list_presets:', presets.presets.length);
+  const dryRun = await tool('run_workflow_preset', { preset: 'research_report', goal: 'smoke', options: { dry_run: true } });
+  console.log('✓ run_workflow_preset dry_run:', dryRun.tasks.length, 'tasks planned, nothing spawned');
+  const sys = await tool('get_system_metrics');
+  console.log('✓ get_system_metrics: tasks.total =', sys.tasks.total, '| cache:', JSON.stringify(sys.cache));
 
   console.log('\nSMOKE TEST PASSED');
 } finally {
