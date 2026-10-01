@@ -109,7 +109,7 @@ test('reconciliation: dead pid with no commit and no final → interrupted', asy
   }
 });
 
-test('reconciliation: live pid (not ours) → interrupted, not left running', async () => {
+test('reconciliation: live pid with mismatched identity → NOT attached (PID-reuse protection)', async () => {
   const repo = makeTempRepo();
   const h = makeHarness(() => FakeScenarios.success());
   try {
@@ -130,15 +130,17 @@ test('reconciliation: live pid (not ours) → interrupted, not left running', as
       capabilities: '[]',
       timeout_seconds: 3600,
     });
-    h.store.updateWorker(workerId, { status: 'running', pid: process.pid });
+    // process.pid IS alive, but its identity (start token + command marker)
+    // does not match a dsh worker — must not attach.
+    h.store.updateWorker(workerId, { status: 'running', pid: process.pid, pid_identity: 'wrong-token' });
     h.store.close();
 
     const store2 = new WorkerStore(h.config.dbPath);
     const supervisor = new WorkerSupervisor(h.config, store2, new FakeBackend({ scenario: () => FakeScenarios.success() }));
     supervisor.init();
     const row = store2.getWorker(workerId)!;
-    assert.equal(row.status, 'interrupted');
-    assert.match(row.error ?? '', /server restarted/);
+    assert.equal(row.status, 'interrupted', 'no final evidence + not attachable → interrupted');
+    assert.match(row.error ?? '', /no final event/);
     store2.close();
   } finally {
     h.cleanup();

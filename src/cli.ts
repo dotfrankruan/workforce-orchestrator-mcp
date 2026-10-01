@@ -355,7 +355,7 @@ async function main(): Promise<void> {
       const id = rest[0];
       if (!id) usage();
       const { supervisor, store } = openSupervisor();
-      printJson(supervisor.result(id));
+      printJson({ ...supervisor.result(id), process: supervisor.processDiagnostics(id) });
       store.close();
       break;
     }

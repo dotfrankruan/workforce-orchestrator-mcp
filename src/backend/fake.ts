@@ -70,10 +70,15 @@ export class FakeBackend implements WorkerBackend {
       queueMicrotask(() => events.onExit(code, signal));
     };
 
+    let byteOffset = 0;
     const emitLine = (line: string) => {
       fs.appendFileSync(opts.stdoutPath, line + '\n');
+      byteOffset += Buffer.byteLength(line, 'utf8') + 1;
       const ev = parseDshLine(line);
-      if (ev) events.onEvent(ev);
+      if (ev) {
+        ev.byteOffset = byteOffset;
+        events.onEvent(ev);
+      }
     };
 
     const runSteps = async () => {

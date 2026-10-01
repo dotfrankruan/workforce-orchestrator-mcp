@@ -19,6 +19,8 @@ export interface DshBackendOptions {
  */
 export class DshBackend implements WorkerBackend {
   readonly name = 'dsh';
+  /** Marker expected in the worker process command line (reattach identity). */
+  readonly processMarker = 'dsh';
 
   constructor(private opts: DshBackendOptions) {}
 
@@ -56,6 +58,7 @@ export class DshBackend implements WorkerBackend {
 
     let exited = false;
     let lineBuf = '';
+    let byteOffset = 0;
 
     child.stdout?.setEncoding('utf8');
     child.stdout?.on('data', (chunk: string) => {
@@ -69,8 +72,12 @@ export class DshBackend implements WorkerBackend {
       while ((idx = lineBuf.indexOf('\n')) >= 0) {
         const line = lineBuf.slice(0, idx);
         lineBuf = lineBuf.slice(idx + 1);
+        byteOffset += Buffer.byteLength(line, 'utf8') + 1;
         const ev = parseDshLine(line);
-        if (ev) events.onEvent(ev);
+        if (ev) {
+          ev.byteOffset = byteOffset;
+          events.onEvent(ev);
+        }
       }
     });
 

@@ -110,6 +110,11 @@ export interface WorkerRow {
   integration_status: string | null; // null | pending | integrating | integrated | conflict | skipped
   integration_error: string | null; // JSON {conflicting_commits, files}
   integrated_commits: string; // JSON array of shas already cherry-picked
+  // v5: durable supervision
+  run_started_at: string | null; // start time of the CURRENT attempt
+  supervision_state: string; // attached | reattached | detached
+  stdout_parse_offset: number; // bytes of stdout.jsonl already parsed
+  pid_identity: string | null; // process start token (ps lstart) at spawn
 }
 
 export interface WorkflowRow {
@@ -196,6 +201,10 @@ export interface WorkerPatch {
   worktree_path?: string;
   base_ref?: string;
   branch?: string;
+  run_started_at?: string | null;
+  supervision_state?: string;
+  stdout_parse_offset?: number;
+  pid_identity?: string | null;
 }
 
 export interface NewWorker {
@@ -436,7 +445,15 @@ const WORKERS_V4_COLUMNS: Array<[string, string]> = [
   ['integrated_commits', `ALTER TABLE workers ADD COLUMN integrated_commits TEXT NOT NULL DEFAULT '[]'`],
 ];
 
-const CURRENT_SCHEMA_VERSION = 4;
+/** Columns added in schema v5 (durable worker supervision). */
+const WORKERS_V5_COLUMNS: Array<[string, string]> = [
+  ['run_started_at', `ALTER TABLE workers ADD COLUMN run_started_at TEXT`],
+  ['supervision_state', `ALTER TABLE workers ADD COLUMN supervision_state TEXT NOT NULL DEFAULT 'attached'`],
+  ['stdout_parse_offset', `ALTER TABLE workers ADD COLUMN stdout_parse_offset INTEGER NOT NULL DEFAULT 0`],
+  ['pid_identity', `ALTER TABLE workers ADD COLUMN pid_identity TEXT`],
+];
+
+const CURRENT_SCHEMA_VERSION = 5;
 
 const ALL_COLUMNS = [
   'id', 'repo_path', 'base_ref', 'branch', 'worktree_path', 'log_dir', 'status', 'task',
@@ -449,6 +466,7 @@ const ALL_COLUMNS = [
   'cache_policy', 'execution_class', 'acceptance', 'budget', 'attempt', 'max_attempts', 'retry_on',
   'task_branch', 'workspace_base_commit', 'task_commits', 'integration_status',
   'integration_error', 'integrated_commits',
+  'run_started_at', 'supervision_state', 'stdout_parse_offset', 'pid_identity',
 ] as const;
 
 function rowToWorker(row: Record<string, unknown>): WorkerRow {
@@ -524,6 +542,14 @@ function migrate(db: DatabaseSync): void {
       if (!columnExists(db, 'workers', col)) db.exec(ddl);
     }
     version = 4;
+  }
+
+  if (version < 5) {
+    for (const [col, ddl] of WORKERS_V5_COLUMNS) {
+      if (!columnExists(db, 'workers', col)) db.exec(ddl);
+    }
+    db.exec(`CREATE TABLE IF NOT EXISTS server_meta (key TEXT PRIMARY KEY, value TEXT)`);
+    version = 5;
   }
 
   db.exec(`CREATE TABLE IF NOT EXISTS schema_meta (id INTEGER PRIMARY KEY CHECK (id = 1), version INTEGER NOT NULL)`);
@@ -843,6 +869,24 @@ export class WorkerStore {
   avgContinues(): number {
     const row = this.db.prepare(`SELECT COALESCE(AVG(continue_count),0) AS a FROM workers WHERE continue_count > 0 OR status IN ('completed','completed_uncommitted')`).get() as { a: number };
     return row.a;
+  }
+
+  /* ------------------------------ server meta counters ------------------------------ */
+
+  metaIncrement(key: string, by = 1): void {
+    this.db
+      .prepare(`INSERT INTO server_meta (key, value) VALUES (?, '0') ON CONFLICT(key) DO NOTHING`)
+      .run(key);
+    this.db
+      .prepare(`UPDATE server_meta SET value = CAST(CAST(value AS INTEGER) + ? AS TEXT) WHERE key = ?`)
+      .run(by, key);
+  }
+
+  metaGet(key: string): number {
+    const row = this.db.prepare(`SELECT value FROM server_meta WHERE key = ?`).get(key) as
+      | { value: string }
+      | undefined;
+    return row ? Number(row.value) : 0;
   }
 
   tokenSumsForWorkflow(wfId: string): { input: number; output: number; cache_read: number } {

@@ -3,6 +3,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod';
 import { WorkerSupervisor, elapsedSeconds } from '../supervisor.js';
 import { isValidWorkerId } from '../util/ids.js';
+import { pidAlive } from '../util/paths.js';
 import type { WorkerRow } from '../db.js';
 
 /**
@@ -40,6 +41,8 @@ function compactStatus(row: WorkerRow): Record<string, unknown> {
     repo_path: row.repo_path || null,
     elapsed_seconds: elapsedSeconds(row),
     last_activity: row.last_progress ?? row.updated_at,
+    supervision: row.supervision_state,
+    process_alive: (row.status === 'running' || row.status === 'starting') && row.pid ? pidAlive(row.pid) : null,
     commit_hash: row.commit_hash ? row.commit_hash.slice(0, 7) : null,
     error: row.error,
     usage: {

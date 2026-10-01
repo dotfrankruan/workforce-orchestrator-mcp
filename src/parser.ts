@@ -50,6 +50,8 @@ export interface DshEvent {
   /** Present when the raw line was not valid JSON. */
   malformed?: boolean;
   rawLine?: string;
+  /** Bytes consumed through the end of this line (durable JSONL checkpoint). */
+  byteOffset?: number;
 }
 
 const KNOWN_TYPES = new Set(['session', 'status', 'thinking', 'text', 'tool_call', 'tool_result', 'final']);
@@ -175,9 +177,17 @@ export interface LogReplay {
   lastText: string | null;
   eventCount: number;
   malformedCount: number;
+  /** Tool calls observed (budget counter restoration). */
+  toolCalls: number;
+  /** Highest turn observed (iteration budget restoration). */
+  lastTurn: number;
+  /** Bytes of complete newline-terminated records (durable offset). */
+  offsetBytes: number;
+  /** Whether the log contains a final event (normal-completion evidence). */
+  hasFinal: boolean;
 }
 
-/** Replay a stored stdout.jsonl file to recover session id, usage and final text. */
+/** Replay a stored stdout.jsonl to recover session, usage, counters, offset. */
 export function replayLogFile(path: string): LogReplay {
   const usage = new UsageTracker();
   const out: LogReplay = {
@@ -188,6 +198,10 @@ export function replayLogFile(path: string): LogReplay {
     lastText: null,
     eventCount: 0,
     malformedCount: 0,
+    toolCalls: 0,
+    lastTurn: 0,
+    offsetBytes: 0,
+    hasFinal: false,
   };
   let content: string;
   try {
@@ -205,9 +219,18 @@ export function replayLogFile(path: string): LogReplay {
       out.cwd = ev.cwd ?? out.cwd;
     }
     if (ev.usage) usage.apply(ev.usage);
-    if (ev.type === 'final' && ev.text) out.finalText = ev.text;
+    if (ev.type === 'tool_call') out.toolCalls++;
+    if (typeof ev.turn === 'number') out.lastTurn = Math.max(out.lastTurn, ev.turn);
+    if (ev.type === 'final' && ev.text) {
+      out.finalText = ev.text;
+      out.hasFinal = true;
+    }
     if (ev.type === 'text' && ev.text) out.lastText = ev.text;
   }
+  // Offset = bytes through the last newline (complete records only; a partial
+  // trailing line is never checkpointed).
+  const lastNewline = content.lastIndexOf('\n');
+  out.offsetBytes = lastNewline >= 0 ? Buffer.byteLength(content.slice(0, lastNewline + 1), 'utf8') : 0;
   return out;
 }
 

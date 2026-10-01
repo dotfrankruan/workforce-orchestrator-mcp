@@ -37,5 +37,8 @@ export interface WorkerBackendHandle {
 
 export interface WorkerBackend {
   readonly name: string;
+  /** Marker expected in a worker process command line (used by reattach
+   * identity checks; omit for in-process backends without real pids). */
+  readonly processMarker?: string;
   start(opts: BackendStartOptions, events: BackendEvents): WorkerBackendHandle;
 }

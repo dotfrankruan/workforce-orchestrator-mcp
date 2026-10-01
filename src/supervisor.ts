@@ -15,6 +15,7 @@ import {
 } from './db.js';
 import { newWorkerId, isValidWorkerId } from './util/ids.js';
 import { pidAlive } from './util/paths.js';
+import { isExpectedWorkerProcess, captureProcessIdentity } from './proc.js';
 import { redactSecrets } from './util/redact.js';
 import { tailLines, truncateUtf8 } from './util/truncate.js';
 import {
@@ -144,6 +145,33 @@ interface ActiveRun {
   budgetInfo?: { reason: string; limit: number; used: number };
   done: Promise<void>;
   resolveDone: () => void;
+  /** Reattached run: no ChildProcess handle, monitored via pid + JSONL tail. */
+  detached?: boolean;
+  tailTimer?: NodeJS.Timeout | null;
+}
+
+/** Handle for a worker process we did not spawn (reattached after restart). */
+class DetachedHandle implements WorkerBackendHandle {
+  constructor(public readonly pid: number) {}
+  async terminate(graceMs: number): Promise<void> {
+    if (!pidAlive(this.pid)) return;
+    try {
+      process.kill(this.pid, 'SIGTERM');
+    } catch {
+      return;
+    }
+    const deadline = Date.now() + graceMs;
+    while (Date.now() < deadline && pidAlive(this.pid)) {
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    if (pidAlive(this.pid)) {
+      try {
+        process.kill(this.pid, 'SIGKILL');
+      } catch {
+        /* already gone */
+      }
+    }
+  }
 }
 
 const MAX_EVENT_SUMMARY = 400;
@@ -198,6 +226,8 @@ function sanitizeDeliverables(input: string[] | undefined): string[] {
 export class WorkerSupervisor {
   private active = new Map<string, ActiveRun>();
   private scheduling = false;
+  /** Set by shutdown(): no further scheduling (workers are detached, not killed). */
+  private shutDown = false;
   /**
    * Event-driven wait support: terminal-state waiters per task id.
    * No locks are held while waiting — waiter callbacks are invoked
@@ -212,8 +242,10 @@ export class WorkerSupervisor {
     private backend: WorkerBackend,
   ) {}
 
-  /** Startup reconciliation: fix statuses of workers whose processes are gone. */
+  /** Startup reconciliation: reattach live workers, finalize finished ones,
+   *  mark only genuinely-vanished workers interrupted. */
   init(): void {
+    this.store.metaIncrement('supervisor_restarts_observed');
     const activeRows = this.store.findActive();
     for (const row of activeRows) {
       if (row.status === 'queued') continue; // will be scheduled below
@@ -250,58 +282,284 @@ export class WorkerSupervisor {
     this.schedule();
   }
 
+  /**
+   * Durable supervision reconciliation. Losing the in-memory handle is NOT
+   * losing the worker:
+   *
+   *   live pid + matching identity → reattach (keep running)
+   *   dead pid + durable final event → finalize normally from the log
+   *   dead pid + no terminal evidence → genuinely interrupted
+   */
   private reconcileRow(row: WorkerRow): void {
-    if (row.pid && pidAlive(row.pid)) {
-      // The process still exists but this server instance has no pipes to it
-      // (server restart). We cannot observe its events anymore; be honest.
-      this.store.updateWorker(row.id, {
-        status: 'interrupted',
-        finished_at: new Date().toISOString(),
-        error: 'server restarted while worker was running; process may still exist but is no longer supervised',
-      });
-      this.store.addEvent(row.id, 'reconcile', 'live pid but unsupervised after restart → interrupted');
-      this.notifyWaiters(row.id);
+    const stdoutPath = path.join(row.log_dir, 'stdout.jsonl');
+    const replay = replayLogFile(stdoutPath);
+
+    const marker = this.backend.processMarker ?? path.basename(this.config.dshBin);
+    const alive = isExpectedWorkerProcess(row.pid, row.pid_identity, marker);
+
+    if (alive) {
+      // Case 1: worker still running → reattach, never interrupted.
+      this.reattachRun(row, replay);
       return;
     }
 
-    // Process is gone. Recover what we can from logs, git and artifacts.
-    const replay = replayLogFile(path.join(row.log_dir, 'stdout.jsonl'));
+    if (replay.hasFinal || row.final_text) {
+      // Case 2: worker finished while unsupervised → normal finalization.
+      this.finalizeFromLog(row, replay);
+      return;
+    }
+
+    // Case 3: genuinely gone with no terminal evidence → interrupted.
     const patch: Partial<WorkerRow> = {
       pid: null,
+      supervision_state: 'detached',
       finished_at: row.finished_at ?? new Date().toISOString(),
       input_tokens: replay.usage.inputTokens,
       output_tokens: replay.usage.outputTokens,
       cache_read_tokens: replay.usage.cacheReadTokens,
       total_tokens_last: replay.usage.lastTotalTokens,
+      stdout_parse_offset: replay.offsetBytes,
+    };
+    if (replay.sessionId && !row.session_id) patch.session_id = replay.sessionId;
+    const git = this.collectGitFacts(row);
+    if (git.commitHash) patch.commit_hash = git.commitHash;
+
+    this.store.updateWorker(row.id, {
+      ...patch,
+      status: 'interrupted',
+      error: 'worker process disappeared before completion (no final event in durable log)',
+    });
+    this.store.addEvent(row.id, 'reconcile', 'dead pid, no final evidence → interrupted');
+    this.store.metaIncrement('workers_genuinely_interrupted');
+    this.finalizeArtifacts(this.get(row.id));
+    this.notifyWaiters(row.id);
+    this.onTaskTerminal(this.get(row.id));
+  }
+
+  /** Case 2: dead process but durable final event → full normal finalization. */
+  private finalizeFromLog(row: WorkerRow, replay: ReturnType<typeof replayLogFile>): void {
+    const patch: Partial<WorkerRow> = {
+      pid: null,
+      supervision_state: 'detached',
+      input_tokens: replay.usage.inputTokens,
+      output_tokens: replay.usage.outputTokens,
+      cache_read_tokens: replay.usage.cacheReadTokens,
+      total_tokens_last: replay.usage.lastTotalTokens,
+      stdout_parse_offset: replay.offsetBytes,
     };
     if (replay.sessionId && !row.session_id) patch.session_id = replay.sessionId;
     if (replay.finalText && !row.final_text) {
       patch.final_text = replay.finalText.slice(0, this.config.finalTextMaxChars);
     }
+    this.store.updateWorker(row.id, patch);
+    let cur = this.get(row.id);
 
-    const git = this.collectGitFacts(row);
-    if (git.commitHash) patch.commit_hash = git.commitHash;
+    // Git finalization (idempotent): commit outstanding changes, integrate.
+    if (cur.workspace_type === 'git_worktree' && fs.existsSync(cur.worktree_path)) {
+      const headBefore = cur.workspace_base_commit ?? cur.base_ref;
+      const fin = this.finalizeGitChanges(cur, headBefore, cur.final_text);
+      this.recordGitFinalize(cur.id, {
+        headBefore,
+        headAfter: currentHead(cur.worktree_path),
+        workerCommitted: fin.workerCommitted,
+        supervisorCommitted: fin.supervisorCommitted,
+        createdBy: fin.workerCommitted && fin.supervisorCommitted ? 'worker+supervisor' : fin.workerCommitted ? 'worker' : fin.supervisorCommitted ? 'supervisor' : null,
+        error: fin.commitError,
+        reconciled: true,
+      });
+      cur = this.get(row.id);
+      const git = this.collectGitFacts(cur);
 
-    let status: WorkerStatus;
-    if (row.workspace_type !== 'git_worktree') {
-      status = replay.finalText ? 'completed' : 'interrupted';
-    } else if (git.commitHash && !git.dirty) {
-      status = 'completed';
-    } else if (git.commitHash && git.dirty) {
-      status = 'completed_uncommitted';
-    } else if (replay.finalText) {
-      status = git.dirty ? 'completed_uncommitted' : 'interrupted';
+      // Record run commits + integrate (idempotent via integrated_commits).
+      if (cur.workflow_id && headBefore) {
+        const newCommits = revListRange(cur.worktree_path, headBefore);
+        if (newCommits.length > 0) {
+          const prevCommits = parseJsonArray(cur.task_commits);
+          const merged = [...new Set([...prevCommits, ...newCommits])];
+          this.store.updateWorker(cur.id, { task_commits: JSON.stringify(merged) });
+        }
+      }
+      const gitStatus: WorkerStatus = fin.commitError && git.dirty
+        ? 'completed_uncommitted'
+        : git.dirty
+          ? 'completed_uncommitted'
+          : 'completed';
+      this.store.updateWorker(cur.id, {
+        status: gitStatus,
+        commit_hash: git.commitHash ?? cur.commit_hash,
+        error: fin.commitError,
+        finished_at: new Date().toISOString(),
+        exit_code: null, // unknown — process was already gone; never fabricate
+      });
+      this.store.addEvent(cur.id, 'reconcile', `durable final found → ${gitStatus}`);
     } else {
-      status = 'interrupted';
+      this.store.updateWorker(cur.id, {
+        status: 'completed',
+        finished_at: new Date().toISOString(),
+        exit_code: null,
+      });
+      this.store.addEvent(cur.id, 'reconcile', 'durable final found → completed');
     }
-    this.store.updateWorker(row.id, {
-      ...patch,
-      status,
-      error: status === 'interrupted' ? 'worker process disappeared before completion' : null,
-    });
-    this.store.addEvent(row.id, 'reconcile', `dead pid → ${status}`);
+
+    // Attempt record (idempotent: once per attempt number).
+    const attempts = this.store.listAttempts(row.id);
+    if (!attempts.some((a) => a.attempt === row.attempt)) {
+      this.store.addAttempt({
+        task_id: row.id,
+        attempt: row.attempt,
+        started_at: row.run_started_at ?? row.started_at,
+        finished_at: new Date().toISOString(),
+        exit_code: null,
+        status: this.get(row.id).status,
+        input_tokens: replay.usage.inputTokens,
+        output_tokens: replay.usage.outputTokens,
+        cache_read_tokens: replay.usage.cacheReadTokens,
+        error: null,
+      });
+    }
+
     this.finalizeArtifacts(this.get(row.id));
     this.notifyWaiters(row.id);
+    const done = this.get(row.id);
+    if (
+      done.workflow_id &&
+      done.workspace_type === 'git_worktree' &&
+      (done.status === 'completed' || done.status === 'completed_uncommitted')
+    ) {
+      // Integration AFTER status, before dependents promote.
+      void this.integrateTask(row.id).finally(() => this.onTaskTerminal(this.get(row.id)));
+    } else {
+      this.onTaskTerminal(done);
+    }
+  }
+
+  /** Case 1: the worker process is still alive — reattach supervision. */
+  private reattachRun(row: WorkerRow, replay: ReturnType<typeof replayLogFile>): void {
+    const usage = new UsageTracker();
+    usage.inputTokens = replay.usage.inputTokens;
+    usage.outputTokens = replay.usage.outputTokens;
+    usage.cacheReadTokens = replay.usage.cacheReadTokens;
+    usage.lastTotalTokens = replay.usage.lastTotalTokens;
+
+    let resolveDone!: () => void;
+    const done = new Promise<void>((r) => (resolveDone = r));
+
+    const handle = new DetachedHandle(row.pid!);
+    const run: ActiveRun = {
+      handle,
+      usage,
+      intent: 'run',
+      timeoutTimer: null,
+      headBeforeRun: row.workspace_base_commit ?? row.base_ref ?? null,
+      toolCalls: replay.toolCalls,
+      lastTurn: replay.lastTurn,
+      startedAt: row.run_started_at ?? row.started_at ?? new Date().toISOString(),
+      done,
+      resolveDone,
+      detached: true,
+      tailTimer: null,
+    };
+    this.active.set(row.id, run);
+
+    this.store.updateWorker(row.id, {
+      supervision_state: 'reattached',
+      status: 'running',
+      session_id: row.session_id ?? replay.sessionId,
+      stdout_parse_offset: replay.offsetBytes,
+      input_tokens: usage.inputTokens,
+      output_tokens: usage.outputTokens,
+      cache_read_tokens: usage.cacheReadTokens,
+      total_tokens_last: usage.lastTotalTokens,
+    });
+    this.store.addEvent(row.id, 'reattach', `pid=${row.pid} offset=${replay.offsetBytes}`);
+    this.store.metaIncrement('workers_reattached');
+
+    // Restore execution timeout from the ORIGINAL run start (never reset).
+    const timeoutSeconds = row.timeout_seconds ?? this.config.defaultTimeoutSeconds;
+    const deadlineMs = Date.parse(run.startedAt) + timeoutSeconds * 1000;
+    const remaining = deadlineMs - Date.now();
+    if (remaining <= 0) {
+      run.intent = 'timeout';
+      this.store.addEvent(row.id, 'timeout', `deadline passed during supervisor downtime; terminating`);
+      void handle.terminate(this.config.terminateGraceMs);
+    } else {
+      run.timeoutTimer = setTimeout(() => {
+        const r = this.active.get(row.id);
+        if (!r) return;
+        r.intent = 'timeout';
+        this.store.addEvent(row.id, 'timeout', `exceeded ${timeoutSeconds}s (incl. supervisor downtime); terminating`);
+        void r.handle.terminate(this.config.terminateGraceMs);
+      }, remaining);
+      run.timeoutTimer.unref();
+    }
+
+    // Tail the durable JSONL from the persisted offset; detect exit via pid.
+    const stdoutPath = path.join(row.log_dir, 'stdout.jsonl');
+    let offset = replay.offsetBytes;
+    let inFlight = false;
+    const poll = () => {
+      const current = this.active.get(row.id);
+      if (current !== run) return; // superseded
+      if (inFlight) return;
+      inFlight = true;
+      try {
+        const size = fs.existsSync(stdoutPath) ? fs.statSync(stdoutPath).size : 0;
+        if (size > offset) {
+          const fd = fs.openSync(stdoutPath, 'r');
+          const buf = Buffer.alloc(size - offset);
+          fs.readSync(fd, buf, 0, buf.length, offset);
+          fs.closeSync(fd);
+          const chunk = buf.toString('utf8');
+          const lines = chunk.split('\n');
+          // Last element is the partial/empty tail — never parse it now.
+          const complete = lines.slice(0, -1);
+          let consumed = 0;
+          for (const line of complete) {
+            consumed += Buffer.byteLength(line, 'utf8') + 1;
+            const ev = parseDshLine(line);
+            if (ev) {
+              ev.byteOffset = offset + consumed;
+              this.handleEvent(row.id, ev, usage);
+            }
+          }
+          offset += consumed;
+          this.store.updateWorker(row.id, { stdout_parse_offset: offset });
+        }
+      } catch {
+        /* read race — retry next poll */
+      } finally {
+        inFlight = false;
+      }
+
+      // Exit detection: process gone → final drain → finalize.
+      if (!pidAlive(row.pid!)) {
+        // One more drain pass on the next tick to catch the final bytes.
+        setTimeout(() => {
+          try {
+            const size = fs.existsSync(stdoutPath) ? fs.statSync(stdoutPath).size : 0;
+            if (size > offset) {
+              const content = fs.readFileSync(stdoutPath, 'utf8').slice(offset);
+              for (const line of content.split('\n')) {
+                const ev = parseDshLine(line);
+                if (ev) this.handleEvent(row.id, ev, usage);
+              }
+              offset = size;
+            }
+          } catch { /* ignore */ }
+          if (run.tailTimer) clearTimeout(run.tailTimer);
+          void this.finalize(row.id, null, null).finally(() => {
+            if (this.active.get(row.id) === run) this.active.delete(row.id);
+            if (run.timeoutTimer) clearTimeout(run.timeoutTimer);
+            resolveDone();
+            this.schedule();
+          });
+        }, 100).unref();
+        return;
+      }
+      run.tailTimer = setTimeout(poll, 500);
+      run.tailTimer.unref();
+    };
+    poll();
   }
 
   /* ------------------------------------------------------------------ *
@@ -1350,6 +1608,11 @@ export class WorkerSupervisor {
         hits: cache.hits,
         artifact_bytes: cache.artifact_bytes,
       },
+      supervision: {
+        supervisor_restarts_observed: this.store.metaGet('supervisor_restarts_observed'),
+        workers_reattached: this.store.metaGet('workers_reattached'),
+        workers_genuinely_interrupted: this.store.metaGet('workers_genuinely_interrupted'),
+      },
     };
   }
 
@@ -1473,7 +1736,7 @@ export class WorkerSupervisor {
   /* ------------------------------------------------------------------ */
 
   private schedule(): void {
-    if (this.scheduling) return;
+    if (this.scheduling || this.shutDown) return;
     this.scheduling = true;
     try {
       this.promoteWaitingTasks();
@@ -1727,6 +1990,8 @@ export class WorkerSupervisor {
     this.store.updateWorker(row.id, {
       status: 'starting',
       started_at: row.started_at ?? new Date().toISOString(),
+      run_started_at: new Date().toISOString(),
+      supervision_state: 'attached',
       error: null,
     });
 
@@ -1794,7 +2059,8 @@ export class WorkerSupervisor {
     runRef.current = run;
     this.active.set(row.id, run);
 
-    this.store.updateWorker(row.id, { status: 'running', pid: handle.pid });
+    const pidIdentity = handle.pid ? (captureProcessIdentity(handle.pid)?.startToken ?? null) : null;
+    this.store.updateWorker(row.id, { status: 'running', pid: handle.pid, pid_identity: pidIdentity });
     this.store.addEvent(row.id, 'start', `pid=${handle.pid ?? 'n/a'} resume=${isResume}`);
 
     const timeoutSeconds = row.timeout_seconds ?? this.config.defaultTimeoutSeconds;
@@ -1816,8 +2082,13 @@ export class WorkerSupervisor {
   }
 
   private handleEvent(workerId: string, ev: DshEvent, usage: UsageTracker): void {
+    if (this.shutDown) return; // detached — worker outlives us; drop late events
     if (ev.usage) usage.apply(ev.usage);
     const run = this.active.get(workerId);
+    if (ev.byteOffset !== undefined) {
+      // Durable parse checkpoint (complete JSONL records only).
+      this.store.updateWorker(workerId, { stdout_parse_offset: ev.byteOffset });
+    }
 
     switch (ev.type) {
       case 'session': {
@@ -2076,11 +2347,12 @@ export class WorkerSupervisor {
 
   private async finalize(workerId: string, exitCode: number | null, signal: string | null): Promise<void> {
     const run = this.active.get(workerId);
-    const row = this.get(workerId);
     if (!run) {
-      // Exit for a run we no longer track (shouldn't happen); ignore.
+      // Exit for a run we no longer track (e.g. a detached worker whose
+      // process ended after supervisor shutdown); ignore without DB access.
       return;
     }
+    const row = this.get(workerId);
 
     // Respect a terminal status set concurrently (e.g. cancel via CLI in
     // another process): keep the status, only refresh observed facts.
@@ -2153,9 +2425,47 @@ export class WorkerSupervisor {
     if (run.intent === 'timeout') {
       provisional = 'timeout';
       provisionalError = `exceeded timeout of ${row.timeout_seconds ?? this.config.defaultTimeoutSeconds}s`;
-    } else if (exitCode !== 0) {
+    } else if (exitCode !== null && exitCode !== 0) {
       provisional = 'failed';
-      provisionalError = `dsh exited with code=${exitCode ?? 'null'} signal=${signal ?? 'null'}`;
+      provisionalError = `dsh exited with code=${exitCode} signal=${signal ?? 'null'}`;
+    } else if (run.detached && exitCode === null) {
+      // Reattached run: no ChildProcess handle, so no exit code. Durable
+      // evidence decides — a final event means normal completion; otherwise
+      // the worker genuinely vanished mid-run.
+      if (row.final_text) {
+        if (row.workspace_type === 'git_worktree') {
+          gitFin = this.finalizeGitChanges(row, run.headBeforeRun, row.final_text);
+          this.recordGitFinalize(workerId, {
+            headBefore: run.headBeforeRun,
+            headAfter: currentHead(row.worktree_path),
+            workerCommitted: gitFin.workerCommitted,
+            supervisorCommitted: gitFin.supervisorCommitted,
+            createdBy: gitFin.workerCommitted && gitFin.supervisorCommitted
+              ? 'worker+supervisor'
+              : gitFin.workerCommitted
+                ? 'worker'
+                : gitFin.supervisorCommitted
+                ? 'supervisor'
+                : null,
+            error: gitFin.commitError,
+          });
+        }
+        const git = this.collectGitFacts(row);
+        if (row.workspace_type !== 'git_worktree') {
+          provisional = 'completed';
+        } else if (gitFin?.commitError && git.dirty) {
+          provisional = 'completed_uncommitted';
+          provisionalError = gitFin.commitError;
+        } else if (git.dirty) {
+          provisional = 'completed_uncommitted';
+          provisionalError = 'worker finished but uncommitted modifications remain in the worktree';
+        } else {
+          provisional = 'completed';
+        }
+      } else {
+        provisional = 'interrupted';
+        provisionalError = 'worker process disappeared without terminal evidence';
+      }
     } else {
       // Clean exit — supervisor-owned git finalization for git worktrees.
       if (row.workspace_type === 'git_worktree') {
@@ -2740,18 +3050,43 @@ export class WorkerSupervisor {
     };
   }
 
-  /** Terminate all active runs (server shutdown). */
+  /**
+   * Graceful server shutdown: DETACH, never kill. Workers are durable —
+   * they outlive the supervisor and will be reattached by the next server
+   * instance via reconciliation. Only cancel_worker/cancel_workflow/
+   * timeout/budget terminate worker processes.
+   */
   async shutdown(): Promise<void> {
-    const runs = [...this.active.entries()];
-    await Promise.all(
-      runs.map(async ([id, run]) => {
-        run.intent = 'cancel';
-        if (run.timeoutTimer) clearTimeout(run.timeoutTimer);
-        await run.handle.terminate(this.config.terminateGraceMs);
-        await run.done.catch(() => {});
-        this.store.addEvent(id, 'shutdown', 'server shutdown');
-      }),
-    );
+    this.shutDown = true;
+    for (const [id, run] of this.active.entries()) {
+      if (run.timeoutTimer) clearTimeout(run.timeoutTimer);
+      if (run.tailTimer) clearTimeout(run.tailTimer);
+      this.store.updateWorker(id, { supervision_state: 'detached' });
+      this.store.addEvent(id, 'shutdown', 'supervisor exiting; worker left running (durable)');
+    }
+    this.active.clear();
+  }
+
+  /** Process diagnostics for CLI inspect / debugging. */
+  processDiagnostics(workerId: string): Record<string, unknown> {
+    const row = this.get(workerId);
+    const marker = this.backend.processMarker ?? path.basename(this.config.dshBin);
+    const alive = row.pid ? pidAlive(row.pid) : false;
+    const identityOk = row.pid ? isExpectedWorkerProcess(row.pid, row.pid_identity, marker) : false;
+    let lastEventAt: string | null = null;
+    const events = this.store.listEvents(workerId, 1);
+    if (events.length > 0) lastEventAt = events[0]!.ts;
+    return {
+      task_id: workerId,
+      status: row.status,
+      pid: row.pid,
+      process_alive: alive,
+      identity_matches: row.pid ? identityOk : null,
+      supervision: row.supervision_state,
+      stdout_parse_offset: row.stdout_parse_offset,
+      run_started_at: row.run_started_at,
+      last_event_at: lastEventAt,
+    };
   }
 }
 
