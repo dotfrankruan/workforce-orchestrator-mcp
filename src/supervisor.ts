@@ -1054,6 +1054,145 @@ export class WorkerSupervisor {
     return { preset: preset.name, ...wf };
   }
 
+  /* ------------------------------ acceptance & metrics ------------------------------ */
+
+  /**
+   * Record a review decision for a completed task. This is Codex's
+   * acceptance state, NOT the execution status. needs_revision never
+   * auto-continues the worker — Codex decides and calls continue_worker.
+   */
+  reviewTaskResult(taskId: string, decision: string, feedback?: string): Record<string, unknown> {
+    const row = this.get(taskId);
+    if (!isTerminal(row.status)) {
+      throw new Error(`task ${taskId} is still ${row.status}; review only terminal tasks`);
+    }
+    if (!['accepted', 'rejected', 'needs_revision'].includes(decision)) {
+      throw new Error(`invalid decision: ${JSON.stringify(decision)} (accepted|rejected|needs_revision)`);
+    }
+    this.store.addReview(taskId, decision, feedback ?? null);
+    this.store.updateWorker(taskId, { acceptance: decision });
+    this.store.addEvent(taskId, 'review', `${decision}${feedback ? `: ${feedback.slice(0, 200)}` : ''}`);
+    return {
+      task_id: taskId,
+      acceptance: decision,
+      status: row.status,
+      note: decision === 'needs_revision' ? 'call continue_worker with rework instructions when ready' : null,
+    };
+  }
+
+  taskMetrics(taskId: string): Record<string, unknown> {
+    const row = this.get(taskId);
+    const events = this.store.listEvents(taskId, 100000);
+    const toolCalls = events.filter((e) => e.type === 'tool_call');
+    const byTool: Record<string, number> = {};
+    for (const e of toolCalls) {
+      const tool = (e.summary ?? '?').split(' (')[0] ?? '?';
+      byTool[tool] = (byTool[tool] ?? 0) + 1;
+    }
+    const artifacts = this.store.listArtifacts(taskId);
+    const gitCommits = row.workspace_type === 'git_worktree' && row.base_ref && fs.existsSync(row.worktree_path)
+      ? commitsAhead(row.worktree_path, row.base_ref)
+      : 0;
+    return {
+      task_id: taskId,
+      mode: row.mode,
+      role: row.role,
+      status: row.status,
+      acceptance: row.acceptance,
+      duration_seconds: elapsedSeconds(row),
+      input_tokens: row.input_tokens,
+      output_tokens: row.output_tokens,
+      cache_read_tokens: row.cache_read_tokens,
+      total_tokens_last: row.total_tokens_last,
+      steps: events.filter((e) => e.type === 'status' && e.summary === 'step_end').length,
+      tool_calls: toolCalls.length,
+      tool_calls_by_tool: byTool,
+      continues: row.continue_count,
+      attempts: row.attempt,
+      artifact_count: artifacts.length,
+      artifact_bytes: artifacts.reduce((s, a) => s + a.size_bytes, 0),
+      git_commits: gitCommits,
+      budget: row.budget ? JSON.parse(row.budget) : null,
+    };
+  }
+
+  workflowMetrics(wfId: string): Record<string, unknown> {
+    const wf = this.store.getWorkflow(wfId);
+    if (!wf) throw new Error(`unknown workflow: ${wfId}`);
+    const rows = this.store.workersInWorkflow(wfId);
+    const tokens = this.store.tokenSumsForWorkflow(wfId);
+    const perTask = rows.map((r) => ({
+      key: r.task_key,
+      task_id: r.id,
+      mode: r.mode,
+      role: r.role,
+      status: r.status,
+      acceptance: r.acceptance,
+      duration_seconds: elapsedSeconds(r),
+      input_tokens: r.input_tokens,
+      output_tokens: r.output_tokens,
+      cache_read_tokens: r.cache_read_tokens,
+      attempts: r.attempt,
+      continues: r.continue_count,
+    }));
+    return {
+      workflow_id: wfId,
+      status: wf.status,
+      duration_seconds: Math.round(((wf.finished_at ? Date.parse(wf.finished_at) : Date.now()) - Date.parse(wf.created_at)) / 1000),
+      tokens: { input: tokens.input, output: tokens.output, cache_read: tokens.cache_read },
+      tasks: perTask.length,
+      attempts: rows.reduce((s, r) => s + r.attempt, 0),
+      continues: rows.reduce((s, r) => s + r.continue_count, 0),
+      per_task: perTask,
+    };
+  }
+
+  /** System-wide aggregate, SQL-driven (no log scanning). */
+  systemMetrics(): Record<string, unknown> {
+    const counts = this.store.statusCounts();
+    const tokens = this.store.tokenSums();
+    const active = (counts['running'] ?? 0) + (counts['starting'] ?? 0);
+    const quality = this.store.acceptanceAgg().map((g) => {
+      const reviewed = g.accepted + g.rejected + g.needs_revision;
+      return {
+        mode: g.grp_mode,
+        role: g.grp_role || null,
+        tasks: g.total,
+        acceptance_rate: reviewed > 0 ? Math.round((g.accepted / reviewed) * 1000) / 1000 : null,
+        revision_rate: reviewed > 0 ? Math.round((g.needs_revision / reviewed) * 1000) / 1000 : null,
+        failure_rate: g.total > 0 ? Math.round((g.failed / g.total) * 1000) / 1000 : null,
+        average_continues: Math.round(g.avg_continues * 100) / 100,
+      };
+    });
+    const cache = this.store.cacheStats();
+    return {
+      period: 'all_time',
+      tasks: {
+        total: Object.values(counts).reduce((s, n) => s + n, 0),
+        by_status: counts,
+      },
+      tokens: { input: tokens.input, output: tokens.output, cache_read: tokens.cache_read },
+      workers: {
+        active,
+        queued: counts['queued'] ?? 0,
+        waiting_dependencies: counts['waiting_dependencies'] ?? 0,
+      },
+      workflows: {
+        total: this.store.listWorkflows(100000).length,
+        running: this.store.runningWorkflows().length,
+      },
+      acceptance: {
+        average_continues: Math.round(this.store.avgContinues() * 100) / 100,
+        by_mode_and_role: quality,
+      },
+      cache: {
+        entries: cache.entries,
+        hits: cache.hits,
+        artifact_bytes: cache.artifact_bytes,
+      },
+    };
+  }
+
   /* ------------------------------------------------------------------ */
 
   async continueWorker(workerId: string, instruction: string): Promise<{ worker_id: string; status: WorkerStatus; session_id: string | null }> {
@@ -2003,6 +2142,8 @@ export class WorkerSupervisor {
       task_id: row.id,
       mode: row.mode,
       status: row.status,
+      acceptance: row.acceptance,
+      role: row.role,
       session_id: row.session_id,
       workspace: { type: row.workspace_type, path: row.worktree_path },
       summary: summary.summary,

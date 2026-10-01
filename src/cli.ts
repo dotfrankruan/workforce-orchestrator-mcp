@@ -298,6 +298,41 @@ async function main(): Promise<void> {
       break;
     }
 
+    case 'review-task': {
+      const id = rest[0];
+      const decision = rest[1];
+      if (!id || !decision) usage();
+      const { supervisor, store } = openSupervisor();
+      printJson(supervisor.reviewTaskResult(id, decision, argValue(rest, '--feedback')));
+      store.close();
+      break;
+    }
+
+    case 'task-metrics': {
+      const id = rest[0];
+      if (!id) usage();
+      const { supervisor, store } = openSupervisor();
+      printJson(supervisor.taskMetrics(id));
+      store.close();
+      break;
+    }
+
+    case 'workflow-metrics': {
+      const id = rest[0];
+      if (!id) usage();
+      const { supervisor, store } = openSupervisor();
+      printJson(supervisor.workflowMetrics(id));
+      store.close();
+      break;
+    }
+
+    case 'metrics': {
+      const { supervisor, store } = openSupervisor();
+      printJson(supervisor.systemMetrics());
+      store.close();
+      break;
+    }
+
     case 'inspect': {
       const id = rest[0];
       if (!id) usage();

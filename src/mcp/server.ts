@@ -459,6 +459,82 @@ export function createMcpServer(supervisor: WorkerSupervisor): McpServer {
   );
 
   server.registerTool(
+    'review_task_result',
+    {
+      title: 'Review task result (acceptance)',
+      description:
+        'Record Codex\'s review decision for a finished task: accepted | rejected | needs_revision (with optional feedback). This is acceptance state, separate from execution status — a completed task can be rejected. needs_revision does NOT auto-restart the worker; call continue_worker with rework instructions when ready. Acceptance history feeds get_system_metrics quality stats.',
+      inputSchema: {
+        task_id: z.string().describe(ID_DESC),
+        decision: z.enum(['accepted', 'rejected', 'needs_revision']),
+        feedback: z.string().optional().describe('Short review note; for needs_revision, what to fix (also pass the details to continue_worker).'),
+      },
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true },
+    },
+    async ({ task_id, decision, feedback }) => {
+      try {
+        requireWorkerId(task_id);
+        return jsonResult(supervisor.reviewTaskResult(task_id, decision, feedback));
+      } catch (err) {
+        return errorResult(err);
+      }
+    },
+  );
+
+  server.registerTool(
+    'get_task_metrics',
+    {
+      title: 'Get task metrics',
+      description: 'Objective run metrics for one task: duration, tokens, steps, tool calls (by tool), continues, attempts, artifact count/bytes, git commits, acceptance. Facts only — no scoring.',
+      inputSchema: { task_id: z.string().describe(ID_DESC) },
+      annotations: READ_ONLY,
+    },
+    async ({ task_id }) => {
+      try {
+        requireWorkerId(task_id);
+        return jsonResult(supervisor.taskMetrics(task_id));
+      } catch (err) {
+        return errorResult(err);
+      }
+    },
+  );
+
+  server.registerTool(
+    'get_workflow_metrics',
+    {
+      title: 'Get workflow metrics',
+      description: 'Aggregate metrics for a workflow: duration, token sums, attempts/continues, and per-task breakdown.',
+      inputSchema: { workflow_id: z.string() },
+      annotations: READ_ONLY,
+    },
+    async ({ workflow_id }) => {
+      try {
+        return jsonResult(supervisor.workflowMetrics(workflow_id));
+      } catch (err) {
+        return errorResult(err);
+      }
+    },
+  );
+
+  server.registerTool(
+    'get_system_metrics',
+    {
+      title: 'Get system metrics',
+      description:
+        'System-wide compact aggregate: task counts by status, token totals, active/queued workers, workflow counts, acceptance quality stats (acceptance/revision/failure rates by mode+role, average continues), cache stats. SQL aggregation — cheap to call.',
+      inputSchema: {},
+      annotations: READ_ONLY,
+    },
+    async () => {
+      try {
+        return jsonResult(supervisor.systemMetrics());
+      } catch (err) {
+        return errorResult(err);
+      }
+    },
+  );
+
+  server.registerTool(
     'get_task_result',
     {
       title: 'Get task result (compact)',
