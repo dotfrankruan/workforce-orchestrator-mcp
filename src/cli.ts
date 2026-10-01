@@ -3,17 +3,18 @@ import fs from 'node:fs';
 import { loadConfig, ensureConfigDirs, type Config } from './config.js';
 import { WorkerStore } from './db.js';
 import { WorkerSupervisor, elapsedSeconds } from './supervisor.js';
-import { DshBackend } from './backends/dsh.js';
 import { FakeBackend, FakeScenarios } from './backends/fake.js';
 import type { WorkerBackend } from './backends/types.js';
+import { BackendRegistry, createDefaultRegistry } from './backends/registry.js';
 import { serveStdio } from './mcp/server.js';
 
-function buildBackend(config: Config): WorkerBackend {
+function buildBackend(config: Config): WorkerBackend | BackendRegistry {
   if (config.backend === 'fake') {
     // For local experimentation only (KIMI_WORKER_BACKEND=fake).
     return new FakeBackend({ scenario: () => FakeScenarios.success() });
   }
-  return new DshBackend({ dshBin: config.dshBin, profile: config.dshProfile });
+  // Zero-config default: DSH at /usr/local/bin/dsh (or PATH), headless profile.
+  return createDefaultRegistry(config);
 }
 
 function openSupervisor(): { supervisor: WorkerSupervisor; store: WorkerStore; config: Config } {
@@ -136,6 +137,8 @@ Usage:
   kimi-worker-mcp roles                 List role templates
   kimi-worker-mcp presets               List workflow presets
   kimi-worker-mcp cache-stats           Artifact cache stats
+  kimi-worker-mcp backends              List runtime backends
+  kimi-worker-mcp backend <id>          Show backend details
 
 Configuration (environment variables):
   KIMI_WORKER_DSH_BIN         dsh binary path (default /usr/local/bin/dsh)
@@ -347,6 +350,22 @@ async function main(): Promise<void> {
     case 'cache-stats': {
       const { supervisor, store } = openSupervisor();
       printJson(supervisor.cacheStats());
+      store.close();
+      break;
+    }
+
+    case 'backends': {
+      const { supervisor, store } = openSupervisor();
+      printJson(supervisor.listBackends());
+      store.close();
+      break;
+    }
+
+    case 'backend': {
+      const id = rest[0];
+      if (!id) usage();
+      const { supervisor, store } = openSupervisor();
+      printJson(supervisor.getBackend(id));
       store.close();
       break;
     }

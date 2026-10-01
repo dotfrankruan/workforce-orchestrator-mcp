@@ -1436,6 +1436,31 @@ export class WorkerSupervisor {
     };
   }
 
+  /* ------------------------------ backends ------------------------------ */
+
+  listBackends(): Array<Record<string, unknown>> {
+    return this.registry.list().map((b) => ({
+      id: b.id,
+      display_name: b.displayName,
+      available: b.isAvailable(),
+      default: b.id === this.registry.defaultBackendId,
+      capabilities: b.capabilities,
+      metadata: b.metadata?.() ?? null,
+    }));
+  }
+
+  getBackend(id: string): Record<string, unknown> {
+    const b = this.registry.get(id);
+    return {
+      id: b.id,
+      display_name: b.displayName,
+      available: b.isAvailable(),
+      default: b.id === this.registry.defaultBackendId,
+      capabilities: b.capabilities,
+      metadata: b.metadata?.() ?? null,
+    };
+  }
+
   /* ------------------------------ roles & presets ------------------------------ */
 
   listRoles(): Array<Record<string, unknown>> {

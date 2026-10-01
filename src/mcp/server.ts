@@ -109,13 +109,48 @@ export function createMcpServer(supervisor: WorkerSupervisor): McpServer {
         deliverables: z.array(z.string()).optional().describe(DELIVERABLES_DESC),
         capabilities: z.array(z.string()).optional().describe(CAPABILITIES_DESC),
         timeout_seconds: z.number().int().positive().optional().describe(TIMEOUT_DESC),
+        backend: z.string().optional().describe('Runtime backend id (see list_backends). Default: router resolves to the configured default — the built-in dsh backend when nothing is configured.'),
       },
       annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
     },
-    async ({ task, mode, workspace, deliverables, capabilities, timeout_seconds }) => {
+    async ({ task, mode, workspace, deliverables, capabilities, timeout_seconds, backend }) => {
       try {
-        const result = supervisor.spawnTask({ task, mode, workspace, deliverables, capabilities, timeout_seconds });
+        const result = supervisor.spawnTask({ task, mode, workspace, deliverables, capabilities, timeout_seconds, backend });
         return jsonResult(result);
+      } catch (err) {
+        return errorResult(err);
+      }
+    },
+  );
+
+  server.registerTool(
+    'list_backends',
+    {
+      title: 'List backends',
+      description: 'List registered runtime backends: id, display name, local availability (no API calls — never touches provider quota), capabilities, and which is the default. Providers/models are reported only when factually known.',
+      inputSchema: {},
+      annotations: READ_ONLY,
+    },
+    async () => {
+      try {
+        return jsonResult({ backends: supervisor.listBackends() });
+      } catch (err) {
+        return errorResult(err);
+      }
+    },
+  );
+
+  server.registerTool(
+    'get_backend',
+    {
+      title: 'Get backend',
+      description: 'Details of one runtime backend: id, availability, capabilities, runtime metadata (facts only).',
+      inputSchema: { backend_id: z.string() },
+      annotations: READ_ONLY,
+    },
+    async ({ backend_id }) => {
+      try {
+        return jsonResult(supervisor.getBackend(backend_id));
       } catch (err) {
         return errorResult(err);
       }
