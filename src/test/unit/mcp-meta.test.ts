@@ -57,7 +57,7 @@ test('every tool has a meaningful description', async () => {
   const { client, cleanup } = await connectClient();
   try {
     const { tools } = await client.listTools();
-    assert.equal(tools.length, 30, 'all 30 tools registered');
+    assert.equal(tools.length, 31, 'all 31 tools registered');
     for (const tool of tools) {
       const desc = tool.description ?? '';
       assert.ok(desc.length >= 60, `${tool.name} description too short (${desc.length} chars)`);
@@ -98,6 +98,11 @@ test('delegation-critical descriptions carry when/when-not semantics', async () 
     assert.match(byName.get('wait_tasks')!, /triggered_by/);
     assert.match(byName.get('spawn_tasks')!, /independent tasks/);
     assert.match(byName.get('spawn_worker')!, /Legacy alias of spawn_task/);
+    // Backend-exhaustion handoff guidance (v4.1).
+    assert.match(byName.get('spawn_task')!, /return control to the human/);
+    assert.match(byName.get('create_workflow')!, /return control to the human/);
+    assert.ok(SERVER_INSTRUCTIONS.includes('retries exhausted'));
+    assert.ok(SERVER_INSTRUCTIONS.includes('let them choose'));
   } finally {
     await cleanup();
   }

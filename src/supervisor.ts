@@ -2494,6 +2494,13 @@ export class WorkerSupervisor {
     };
     if (row.error) result['error'] = redactSecrets(row.error);
     if (row.exit_code !== null) result['exit_code'] = row.exit_code;
+    // Backend-exhaustion handoff metadata (facts only, no cause guessing).
+    result['attempts'] = row.attempt;
+    result['retries_exhausted'] =
+      (row.status === 'failed' || row.status === 'timeout') &&
+      parseJsonArray(row.retry_on).includes(row.status) &&
+      row.attempt >= row.max_attempts;
+    if (isTerminal(row.status)) result['work_preserved'] = fs.existsSync(row.worktree_path);
     return result;
   }
 

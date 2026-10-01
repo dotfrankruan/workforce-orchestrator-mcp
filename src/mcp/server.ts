@@ -15,7 +15,7 @@ Delegate execution-heavy work when useful: broad repository exploration; multi-f
 
 For multi-step delegated work, prefer create_workflow or run_workflow_preset over manual spawn chains — dependents start automatically when upstream tasks complete (all_success) or terminate (all_terminal); failed dependencies block dependents by default. Use roles (implementer/tester/researcher/reviewer/…) to shape worker behavior; declare deliverables so results land as verifiable files.
 
-Workflow: spawn_task / create_workflow → continue Codex-side work while workers run → wait_task / wait_tasks / wait_workflow when results are needed → get_task_result / get_workflow_result (compact by default) → review_task_result to record acceptance. Avoid repeated get_worker polling; a wait timeout never cancels the worker. Fetch logs/diffs/artifact contents only when needed. For substantial corrections, prefer continue_worker on the same session over redoing the work.`;
+Workflow: spawn_task / create_workflow → continue Codex-side work while workers run → wait_task / wait_tasks / wait_workflow when results are needed → get_task_result / get_workflow_result (compact by default) → review_task_result to record acceptance. Avoid repeated get_worker polling; a wait timeout never cancels the worker. Fetch logs/diffs/artifact contents only when needed. For substantial corrections, prefer continue_worker on the same session. If delegated execution repeatedly fails with retries exhausted, tell the human (work is preserved) and let them choose: retry later, do it Codex-side, or abandon — never silently substitute expensive Codex-side execution.`;
 
 function jsonResult(data: unknown): { content: Array<{ type: 'text'; text: string }> } {
   return {
@@ -85,7 +85,7 @@ export function createMcpServer(supervisor: WorkerSupervisor): McpServer {
         'Delegate substantial execution work to a Kimi K3 worker.\n\n' +
         'Use proactively when a task involves significant repository exploration, implementation, testing/debugging, long tool trajectories, research, data analysis, documentation, file processing, independent review, or work that can beneficially run in parallel. Multiple independent tasks may run in parallel.\n\n' +
         'Codex should normally retain planning, architectural decisions, review, validation, and final integration.\n\n' +
-        'Avoid using this tool for tiny edits or trivial one-step operations where delegation overhead exceeds the task.\n\n' +
+        'Avoid using this tool for tiny edits or trivial one-step operations where delegation overhead exceeds the task. If delegated execution repeatedly fails and its retry policy is exhausted, return control to the human instead of silently substituting expensive Codex-side execution.\n\n' +
         'Returns immediately with a task id; when the result is needed use wait_task / wait_tasks (not get_worker polling), then inspect get_task_result. Workers write substantial output to workspace files (see deliverables) instead of returning it inline.\n\n' +
         'For isolated git coding tasks the worker modifies and tests the worktree; the workforce supervisor finalizes successful changes into a worker-branch commit automatically — no commit instructions needed in the task text.',
       inputSchema: {
@@ -229,7 +229,7 @@ export function createMcpServer(supervisor: WorkerSupervisor): McpServer {
       description:
         'Create a multi-task workflow: a dependency DAG of Kimi tasks sharing one workspace. Dependencies reference per-task keys (not ids); cycles are rejected. Tasks without dependencies start immediately (parallel), dependents start automatically when their dependencies complete (all_success) or terminate (all_terminal).\n\n' +
         'Use for multi-track delegated work: research → implement → test → review pipelines, parallel analysis with a synthesis step, etc. Then wait_workflow / get_workflow_result.\n\n' +
-        'failure_policy: stop_dependents (default; downstream of a failed task is blocked) | continue (independent branches proceed; all_terminal dependents still run) | cancel_remaining.',
+        'failure_policy: stop_dependents (default; downstream of a failed task is blocked) | continue (independent branches proceed; all_terminal dependents still run) | cancel_remaining. If delegated execution repeatedly fails and retries are exhausted, return control to the human rather than silently substituting Codex-side execution.',
       inputSchema: {
         name: z.string().optional(),
         tasks: z
@@ -362,6 +362,28 @@ export function createMcpServer(supervisor: WorkerSupervisor): McpServer {
     async ({ workflow_id }) => {
       try {
         return jsonResult(await supervisor.cancelWorkflow(workflow_id));
+      } catch (err) {
+        return errorResult(err);
+      }
+    },
+  );
+
+  server.registerTool(
+    'get_workflow_diff',
+    {
+      title: 'Get workflow diff',
+      description:
+        'Inspect the integrated changes of a git workflow: diff of the integration branch vs its base ref (all integrated task commits combined). Defaults to --stat; request stat_only=false for the full patch (size-capped, redacted). Use for final review before Codex decides how to integrate the workflow branch.',
+      inputSchema: {
+        workflow_id: z.string(),
+        stat_only: z.boolean().optional().describe('Default true.'),
+        path: z.string().optional().describe('Restrict to one relative path.'),
+      },
+      annotations: READ_ONLY,
+    },
+    async ({ workflow_id, stat_only, path }) => {
+      try {
+        return jsonResult(supervisor.workflowDiff(workflow_id, { stat_only, path }));
       } catch (err) {
         return errorResult(err);
       }
