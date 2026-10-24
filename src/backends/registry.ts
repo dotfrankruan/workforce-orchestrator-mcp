@@ -82,9 +82,51 @@ export function defaultConfigPath(): string {
   return path.join(os.homedir(), '.workforce', 'config.json');
 }
 
-/** Optional user config. Absent file = built-in defaults. Never required. */
-export function loadFileConfig(configPath?: string): WorkforceFileConfig | null {
-  const p = configPath ?? defaultConfigPath();
+/**
+ * Resolve the config path. An explicit argument wins, then WORKFORCE_CONFIG,
+ * then the documented default location.
+ */
+export function resolveConfigPath(configPath?: string, env: NodeJS.ProcessEnv = process.env): string {
+  return configPath ?? (env.WORKFORCE_CONFIG && env.WORKFORCE_CONFIG !== '' ? env.WORKFORCE_CONFIG : defaultConfigPath());
+}
+
+/** Starter file written on first start. Deliberately pins nothing. */
+export const STARTER_CONFIG: WorkforceFileConfig = {
+  default_backend: 'auto',
+  backends: {},
+  routing: { default: 'auto', roles: {} },
+};
+
+/**
+ * Create a starter config on first start if none exists. Existing files are
+ * never modified. Returns whether a file was created.
+ */
+export function ensureFileConfig(
+  configPath?: string,
+  env: NodeJS.ProcessEnv = process.env,
+): { path: string; created: boolean } {
+  const p = resolveConfigPath(configPath, env);
+  if (fs.existsSync(p)) return { path: p, created: false };
+  fs.mkdirSync(path.dirname(p), { recursive: true, mode: 0o700 });
+  try {
+    fs.writeFileSync(p, JSON.stringify(STARTER_CONFIG, null, 2) + '\n', {
+      encoding: 'utf8',
+      mode: 0o600,
+      flag: 'wx',
+    });
+    return { path: p, created: true };
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'EEXIST') return { path: p, created: false };
+    throw new Error(`could not create starter workforce config at ${p}: ${(err as Error).message}`);
+  }
+}
+
+/**
+ * Optional user config. Absent file = built-in defaults; the CLI additionally
+ * writes a starter config on first start. Never required.
+ */
+export function loadFileConfig(configPath?: string, env: NodeJS.ProcessEnv = process.env): WorkforceFileConfig | null {
+  const p = resolveConfigPath(configPath, env);
   try {
     const raw = fs.readFileSync(p, 'utf8');
     const parsed = JSON.parse(raw) as unknown;
@@ -273,7 +315,7 @@ export function createDefaultRegistry(
   opts: { extraBackends?: WorkerBackend[] | undefined; env?: NodeJS.ProcessEnv | undefined; configPath?: string | undefined } = {},
 ): BackendRegistry {
   const env = opts.env ?? process.env;
-  const fileConfig = loadFileConfig(opts.configPath);
+  const fileConfig = loadFileConfig(opts.configPath, env);
 
   // dsh
   const exe = resolveDshExecutable(config, fileConfig);

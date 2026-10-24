@@ -25,7 +25,7 @@ git(['add', '-A']);
 git(['commit', '-qm', 'init']);
 const mainHead = git(['rev-parse', 'HEAD']).trim();
 
-const env = { ...process.env, WORKFORCE_ROOT: workerRoot };
+const env = { ...process.env, WORKFORCE_ROOT: workerRoot, WORKFORCE_CONFIG: path.join(workerRoot, 'config.json') };
 
 function startServer() {
   const srv = spawn(process.execPath, ['dist/cli.js', 'serve'], { env, stdio: ['pipe', 'pipe', 'pipe'] });

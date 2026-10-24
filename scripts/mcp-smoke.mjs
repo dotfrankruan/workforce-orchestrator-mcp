@@ -18,6 +18,7 @@ const server = spawn(process.execPath, ['dist/cli.js', 'serve'], {
     ...process.env,
     WORKFORCE_BACKEND: 'fake',
     WORKFORCE_ROOT: workerRoot,
+    WORKFORCE_CONFIG: path.join(workerRoot, 'config.json'),
     WORKFORCE_TERMINATE_GRACE_MS: '200',
   },
   stdio: ['pipe', 'pipe', 'inherit'],

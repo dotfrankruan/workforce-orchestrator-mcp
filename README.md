@@ -135,9 +135,14 @@ WORKFORCE_ROOT = "~/.workforce/workers"
 The orchestrator works with zero configuration. The optional config file is the
 single place to pin executables, choose models, and route roles.
 
-- **Absent** → built-in defaults and `auto` backend selection.
-- **Present** → strict JSON (no comments, no YAML), read once at startup.
-- Copy the template:
+- **First CLI start** → if the file is absent, a minimal starter config is
+  written automatically (`{"default_backend":"auto", ...}`). It pins nothing,
+  so local backend discovery still applies.
+- **Existing file** → strict JSON (no comments, no YAML), read once at startup
+  and never modified by the server.
+- **WORKFORCE_CONFIG** → override the config file location (useful for CI,
+  tests, or per-project configs).
+- To start from the fully populated reference instead of the starter:
 
   ```bash
   mkdir -p ~/.workforce
@@ -216,6 +221,7 @@ a key; in that case the backend is considered available even with an empty key.
 |---|---|---|
 | `WORKFORCE_BACKEND` | `auto` | `auto`, `dsh`, `opencode`, `openai`, `anthropic`, `fake` |
 | `WORKFORCE_DEFAULT_BACKEND` | — | Routing default (overrides `WORKFORCE_BACKEND`) |
+| `WORKFORCE_CONFIG` | `~/.workforce/config.json` | Config file path (created on first start if absent) |
 | `WORKFORCE_ROOT` | `~/.workforce/workers` | State root (worktrees, task workspaces, db) |
 | `WORKFORCE_DB` | `<root>/workers.db` | SQLite database |
 | `WORKFORCE_MAX_CONCURRENT` | `4` | Max parallel tasks |

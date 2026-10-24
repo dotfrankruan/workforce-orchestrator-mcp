@@ -7,6 +7,9 @@ import {
   BackendRegistry,
   resolveDshExecutable,
   loadFileConfig,
+  ensureFileConfig,
+  resolveConfigPath,
+  STARTER_CONFIG,
 } from '../../backends/registry.js';
 import { DshBackend } from '../../backends/dsh.js';
 import { FakeBackend, FakeScenarios } from '../../backends/fake.js';
@@ -213,4 +216,32 @@ test('config file is read from ~/.workforce/config.json (documented path)', () =
     else process.env.HOME = prevHome;
     removeDir(tmpHome);
   }
+});
+
+test('starter config is created on first start and never overwritten', () => {
+  const root = makeTempDir('kwm-cfg-');
+  try {
+    const p = path.join(root, '.workforce', 'config.json');
+    const first = ensureFileConfig(p, {});
+    assert.equal(first.created, true);
+    assert.equal(first.path, p);
+    assert.ok(fs.existsSync(p));
+
+    const parsed = JSON.parse(fs.readFileSync(p, 'utf8')) as unknown;
+    assert.deepEqual(parsed, STARTER_CONFIG);
+
+    // Existing user edits are preserved.
+    fs.writeFileSync(p, JSON.stringify({ default_backend: 'opencode' }) + '\n');
+    const second = ensureFileConfig(p, {});
+    assert.equal(second.created, false);
+    assert.equal(loadFileConfig(p, {})?.default_backend, 'opencode');
+  } finally {
+    removeDir(root);
+  }
+});
+
+test('config path resolves explicit > WORKFORCE_CONFIG > default', () => {
+  assert.equal(resolveConfigPath('/tmp/explicit.json', { WORKFORCE_CONFIG: '/tmp/env.json' }), '/tmp/explicit.json');
+  assert.equal(resolveConfigPath(undefined, { WORKFORCE_CONFIG: '/tmp/env.json' }), '/tmp/env.json');
+  assert.match(resolveConfigPath(undefined, {}), /\.workforce\/config\.json$/);
 });

@@ -5,7 +5,7 @@ import { WorkerStore } from './db.js';
 import { WorkerSupervisor, elapsedSeconds } from './supervisor.js';
 import { FakeBackend, FakeScenarios } from './backends/fake.js';
 import type { WorkerBackend } from './backends/types.js';
-import { BackendRegistry, createDefaultRegistry } from './backends/registry.js';
+import { BackendRegistry, createDefaultRegistry, ensureFileConfig } from './backends/registry.js';
 import { serveStdio } from './mcp/server.js';
 
 function buildBackend(config: Config): WorkerBackend | BackendRegistry {
@@ -21,6 +21,10 @@ function buildBackend(config: Config): WorkerBackend | BackendRegistry {
 function openSupervisor(): { supervisor: WorkerSupervisor; store: WorkerStore; config: Config } {
   const config = loadConfig();
   ensureConfigDirs(config);
+  const starter = ensureFileConfig();
+  if (starter.created) {
+    process.stderr.write(`workforce-mcp: created starter config at ${starter.path}\n`);
+  }
   const store = new WorkerStore(config.dbPath);
   const supervisor = new WorkerSupervisor(config, store, buildBackend(config));
   return { supervisor, store, config };
@@ -143,6 +147,7 @@ Usage:
 
 Configuration (environment variables):
   WORKFORCE_BACKEND               auto (default), dsh, opencode, openai, anthropic, fake
+  WORKFORCE_CONFIG                config path (default ~/.workforce/config.json; created on first start)
   WORKFORCE_ROOT                  worker state root (default ~/.workforce/workers)
   WORKFORCE_DB                    SQLite db path (default <root>/workers.db)
   WORKFORCE_MAX_CONCURRENT        max parallel workers (default 4)

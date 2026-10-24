@@ -29,7 +29,14 @@ export { OpenCodeBackend, parseOpenCodeLine } from './backends/opencode.js';
 export { OpenAIBackend } from './backends/openai.js';
 export { AnthropicBackend } from './backends/anthropic.js';
 export { FakeBackend, FakeScenarios, type FakeScenario, type FakeStep } from './backends/fake.js';
-export { BackendRegistry, createDefaultRegistry, loadFileConfig } from './backends/registry.js';
+export {
+  BackendRegistry,
+  createDefaultRegistry,
+  loadFileConfig,
+  ensureFileConfig,
+  resolveConfigPath,
+  STARTER_CONFIG,
+} from './backends/registry.js';
 export type { WorkerBackend } from './backends/types.js';
 export { createMcpServer, serveStdio } from './mcp/server.js';
 export { parseDshLine, UsageTracker, summarizeFinalText, renderLogLine, replayLogFile } from './parser.js';

@@ -9,7 +9,7 @@ import readline from 'node:readline';
 
 const workerRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'kwm-wait-root-'));
 const server = spawn(process.execPath, ['dist/cli.js', 'serve'], {
-  env: { ...process.env, WORKFORCE_ROOT: workerRoot },
+  env: { ...process.env, WORKFORCE_ROOT: workerRoot, WORKFORCE_CONFIG: path.join(workerRoot, 'config.json') },
   stdio: ['pipe', 'pipe', 'inherit'],
 });
 
