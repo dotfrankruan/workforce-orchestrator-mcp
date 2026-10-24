@@ -1,5 +1,5 @@
 // Real research-mode E2E: spawn_task(mode=research) against the real
-// /usr/local/bin/dsh (Kimi K3) in a TemporaryWorkspace — no network
+// /usr/local/bin/dsh (DSH backend) in a TemporaryWorkspace — no network
 // dependency: the worker only reports on its (empty) workspace.
 // Usage: node scripts/research-e2e.mjs
 import { spawn } from 'node:child_process';
@@ -10,7 +10,7 @@ import readline from 'node:readline';
 
 const workerRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'kwm-research-root-'));
 const server = spawn(process.execPath, ['dist/cli.js', 'serve'], {
-  env: { ...process.env, KIMI_WORKER_ROOT: workerRoot },
+  env: { ...process.env, WORKFORCE_ROOT: workerRoot },
   stdio: ['pipe', 'pipe', 'inherit'],
 });
 
@@ -55,7 +55,7 @@ try {
     clientInfo: { name: 'research-e2e', version: '0.0.1' },
   });
 
-  console.log('→ spawning real research task (live Kimi K3, no web needed)…');
+  console.log('→ spawning real research task (live DSH backend, no web needed)…');
   const spawnRes = await tool('spawn_task', {
     mode: 'research',
     task: 'Create a short report about the contents of this workspace. Save it as report.md. Also write summary.json containing {"description": "..."} with one line describing the workspace contents.',

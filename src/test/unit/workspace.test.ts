@@ -82,7 +82,7 @@ test('git_worktree workspace plans branch and creates worktree', () => {
   const plan = planWorkspace('git_worktree', { repo_path: repo }, ctx(root));
   assert.equal(plan.repoPath, fs.realpathSync(repo));
   assert.equal(plan.baseRef, base);
-  assert.equal(plan.branch, 'kimi-worker/wk_test0001');
+  assert.equal(plan.branch, 'workforce/worker/wk_test0001');
   prepareWorkspace(plan);
   assert.ok(fs.existsSync(path.join(plan.cwd, 'hello.txt')));
 

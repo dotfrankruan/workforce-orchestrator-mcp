@@ -313,9 +313,10 @@ export class WorkerSupervisor {
    */
   private reconcileRow(row: WorkerRow): void {
     const stdoutPath = path.join(row.log_dir, 'stdout.jsonl');
-    const replay = replayLogFile(stdoutPath);
+    const backend = this.backendFor(row);
+    const replay = replayLogFile(stdoutPath, (line) => (backend.parseLine ? backend.parseLine(line) : parseDshLine(line)));
 
-    const marker = this.backendFor(row).processMarker ?? path.basename(this.config.dshBin);
+    const marker = backend.processMarker ?? backend.id;
     const alive = isExpectedWorkerProcess(row.pid, row.pid_identity, marker);
 
     if (alive) {
@@ -541,9 +542,11 @@ export class WorkerSupervisor {
     const chunk = buf.toString('utf8');
     const lines = chunk.split('\n');
     // Last element is the partial/empty tail — leave it for next time.
+    const parseLine =
+      run.backend?.parseLine ? (line: string) => run.backend!.parseLine!(line) : parseDshLine;
     for (const line of lines.slice(0, -1)) {
       offset += Buffer.byteLength(line, 'utf8') + 1;
-      const ev = parseDshLine(line);
+      const ev = parseLine(line);
       if (ev) {
         ev.byteOffset = offset;
         this.handleEvent(workerId, ev, run.usage);
@@ -689,9 +692,9 @@ export class WorkerSupervisor {
       const wf = workflowCtx.workflow;
       if (wf.workspace_type === 'git_worktree') {
         // Parallel Git isolation: every workflow task gets its OWN worktree
-        // and branch (kimi-task/<id>), materialized lazily at run start from
+        // and branch (workforce/task/<id>), materialized lazily at run start from
         // the then-current integration HEAD. The workflow-level workspace is
-        // the integration worktree (kimi-workflow/<wf>) — workers never touch
+        // the integration worktree (workforce/workflow/<wf>) — workers never touch
         // it directly.
         plan = {
           type: 'git_worktree',
@@ -702,7 +705,7 @@ export class WorkerSupervisor {
           baseRef: wf.base_ref, // refined to the snapshot commit at materialization
           branch: '',
         };
-        taskBranch = `kimi-task/${id}`;
+        taskBranch = `workforce/task/${id}`;
         integrationStatus = 'pending';
       } else {
         // Non-git workflows: shared workspace (unchanged semantics).
@@ -904,7 +907,7 @@ export class WorkerSupervisor {
    *
    * A low-frequency re-check (every WAIT_RECHECK_MS at most) is kept as a
    * fallback for terminal transitions performed by OTHER processes
-   * (e.g. `kimi-worker-mcp cancel` from the CLI), which cannot notify
+   * (e.g. `workforce-mcp cancel` from the CLI), which cannot notify
    * this process's in-memory waiters.
    * ------------------------------------------------------------------ */
 
@@ -1696,7 +1699,7 @@ export class WorkerSupervisor {
       throw new Error(`worker ${workerId} is still active; cancel it or wait for completion before continuing`);
     }
     if (!row.session_id) {
-      throw new Error(`worker ${workerId} has no recorded dsh session id; cannot resume`);
+      throw new Error(`worker ${workerId} has no recorded backend session id; cannot resume`);
     }
 
     // Continue after integration: the task's old worktree branched from an
@@ -1715,7 +1718,7 @@ export class WorkerSupervisor {
       const integrationHead = currentHead(wf.workspace_path);
       if (!integrationHead) throw new Error('integration worktree has no HEAD');
       const n = row.continue_count + 1;
-      const newBranch = `kimi-task/${row.id}-r${n}`;
+      const newBranch = `workforce/task/${row.id}-r${n}`;
       const newPath = path.join(wf.log_dir, 'tasks', row.id, `worktree-r${n}`);
       createWorktreeAtCommit(wf.repo_path, newPath, newBranch, integrationHead);
       this.store.updateWorker(workerId, {
@@ -1974,7 +1977,7 @@ export class WorkerSupervisor {
     if (row.workflow_id) {
       const wf = this.store.getWorkflow(row.workflow_id);
       const wb = this.workflowBudget(wf);
-      const maxWorkerTokens = wb?.max_worker_tokens ?? wb?.max_kimi_tokens; // deprecated alias
+      const maxWorkerTokens = wb?.max_worker_tokens;
       if (wf && maxWorkerTokens) {
         const sums = this.store.tokenSumsForWorkflow(wf.id);
         const used = sums.input + sums.output + sums.cache_read;
@@ -2016,7 +2019,7 @@ export class WorkerSupervisor {
     // (workspace refreshed to the current integration HEAD).
     if (row.continue_count > 0) return buildContinuePrompt(this.peekContinueInstruction(row));
     const subagentsNote =
-      this.config.enableDshSubagents && (row.mode === 'research' || row.mode === 'general')
+      this.config.enableSubagents && (row.mode === 'research' || row.mode === 'general')
         ? `You may delegate independent sub-investigations to subagents when your runtime supports it (depth ≤ ${this.config.maxSubagentDepth}, at most ${this.config.maxSubagentsPerTask} subagents). Keep delegation minimal and integrate the results yourself.`
         : undefined;
     return buildModePrompt(row.mode as TaskMode, {
@@ -2041,7 +2044,7 @@ export class WorkerSupervisor {
       if (!wf) throw new Error(`workflow ${row.workflow_id} missing for task ${row.id}`);
       const integrationHead = currentHead(wf.workspace_path);
       if (!integrationHead) throw new Error(`integration worktree has no HEAD: ${wf.workspace_path}`);
-      createWorktreeAtCommit(wf.repo_path, row.worktree_path, row.task_branch ?? `kimi-task/${row.id}`, integrationHead);
+      createWorktreeAtCommit(wf.repo_path, row.worktree_path, row.task_branch ?? `workforce/task/${row.id}`, integrationHead);
       this.store.updateWorker(row.id, { workspace_base_commit: integrationHead, base_ref: integrationHead });
       this.store.addEvent(row.id, 'workspace', `snapshot=${integrationHead.slice(0, 12)} branch=${row.task_branch}`);
       row = this.get(row.id);
@@ -2204,8 +2207,13 @@ export class WorkerSupervisor {
     switch (ev.type) {
       case 'session': {
         if (ev.sessionId) {
-          this.store.updateWorker(workerId, { session_id: ev.sessionId });
-          this.store.addEvent(workerId, 'session', ev.sessionId);
+          // Backends may report the same session on every step (e.g. OpenCode
+          // step_start); persist it once so run metrics stay accurate.
+          const current = this.store.getWorker(workerId);
+          if (current?.session_id !== ev.sessionId) {
+            this.store.updateWorker(workerId, { session_id: ev.sessionId });
+            this.store.addEvent(workerId, 'session', ev.sessionId);
+          }
         }
         break;
       }
@@ -2386,8 +2394,8 @@ export class WorkerSupervisor {
 
   private fallbackCommitMessage(row: WorkerRow, remainder: boolean): string {
     return remainder
-      ? `kimi-worker/${row.id}: finalize remaining changes`
-      : `kimi-worker/${row.id}: apply delegated changes`;
+      ? `workforce/worker/${row.id}: finalize remaining changes`
+      : `workforce/worker/${row.id}: apply delegated changes`;
   }
 
   /**
@@ -2549,7 +2557,7 @@ export class WorkerSupervisor {
       provisionalError = `exceeded timeout of ${row.timeout_seconds ?? this.config.defaultTimeoutSeconds}s`;
     } else if (exitCode !== null && exitCode !== 0) {
       provisional = 'failed';
-      provisionalError = `dsh exited with code=${exitCode} signal=${signal ?? 'null'}`;
+      provisionalError = `backend exited with code=${exitCode} signal=${signal ?? 'null'}`;
     } else if (run.detached && exitCode === null) {
       // Reattached run: no ChildProcess handle, so no exit code. Durable
       // evidence decides — a final event means normal completion; otherwise
@@ -3122,9 +3130,11 @@ export class WorkerSupervisor {
     } catch {
       content = '';
     }
+    const backend = this.backendFor(row);
+    const parseLine = backend.parseLine ? (line: string) => backend.parseLine!(line) : parseDshLine;
     const rendered: string[] = [];
     for (const line of tailLines(content, tail).split('\n')) {
-      const ev = parseDshLine(line);
+      const ev = parseLine(line);
       if (ev) rendered.push(renderLogLine(ev));
     }
     let out = rendered.join('\n');
@@ -3194,7 +3204,8 @@ export class WorkerSupervisor {
   /** Process diagnostics for CLI inspect / debugging. */
   processDiagnostics(workerId: string): Record<string, unknown> {
     const row = this.get(workerId);
-    const marker = this.backendFor(row).processMarker ?? path.basename(this.config.dshBin);
+    const backend = this.backendFor(row);
+    const marker = backend.processMarker ?? backend.id;
     const alive = row.pid ? pidAlive(row.pid) : false;
     const identityOk = row.pid ? isExpectedWorkerProcess(row.pid, row.pid_identity, marker) : false;
     let lastEventAt: string | null = null;

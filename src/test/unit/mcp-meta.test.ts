@@ -83,7 +83,7 @@ test('delegation-critical descriptions carry when/when-not semantics', async () 
     assert.match(spawnTask, /Avoid using this tool for tiny edits/);
     assert.match(spawnTask, /Codex should normally retain planning/);
 
-    assert.match(byName.get('continue_worker')!, /same Kimi\/DSH session/);
+    assert.match(byName.get('continue_worker')!, /same worker backend session/);
     assert.match(byName.get('continue_worker')!, /prefer continuing the existing task/);
     assert.match(byName.get('get_task_result')!, /default first inspection step/);
     assert.match(byName.get('list_artifacts')!, /without loading their contents/);

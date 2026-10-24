@@ -1,5 +1,5 @@
 // Real end-to-end test: spawn a worker backed by the real /usr/local/bin/dsh
-// (Kimi K3) in a temporary git repo, wait for completion, print the compact
+// (DSH backend) in a temporary git repo, wait for completion, print the compact
 // result and verify continue_worker resumes the session.
 // Usage: node scripts/real-dsh-e2e.mjs
 import { spawn } from 'node:child_process';
@@ -25,7 +25,7 @@ git(['commit', '-qm', 'init']);
 const mainHeadBefore = git(['rev-parse', 'HEAD']).trim();
 
 const server = spawn(process.execPath, ['dist/cli.js', 'serve'], {
-  env: { ...process.env, KIMI_WORKER_ROOT: workerRoot },
+  env: { ...process.env, WORKFORCE_ROOT: workerRoot },
   stdio: ['pipe', 'pipe', 'inherit'],
 });
 
@@ -70,7 +70,7 @@ try {
     clientInfo: { name: 'real-e2e', version: '0.0.1' },
   });
 
-  console.log('→ spawning real Kimi worker (this calls the live API)…');
+  console.log('→ spawning real worker (this calls the live API)…');
   const spawnRes = await tool('spawn_worker', {
     repo_path: repoPath,
     task: 'Change README.md title from "# e2e test repo" to "# e2e test repo (updated)". Verify the file contents afterwards. Do NOT create any git commit.',

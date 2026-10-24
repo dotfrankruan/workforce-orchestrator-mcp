@@ -1,9 +1,13 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { execFileSync } from 'node:child_process';
 import type { Config } from '../config.js';
 import { DshBackend } from './dsh.js';
+import { OpenCodeBackend } from './opencode.js';
+import { OpenAIBackend, type OpenAIApiStyle } from './openai.js';
+import { AnthropicBackend } from './anthropic.js';
+import { FakeBackend, FakeScenarios } from './fake.js';
+import { isExecutable, which } from '../util/executable.js';
 import type { WorkerBackend } from './types.js';
 
 /* ------------------------------------------------------------------ *
@@ -13,17 +17,59 @@ import type { WorkerBackend } from './types.js';
  *   1. explicit task/workflow backend
  *   2. role routing rule (config file)
  *   3. routing default (config file)
- *   4. environment override (WORKFORCE_DEFAULT_BACKEND)
- *   5. built-in default: dsh
+ *   4. default_backend (config file)
+ *   5. WORKFORCE_DEFAULT_BACKEND env var
+ *   6. WORKFORCE_BACKEND env var / config.backend (unless "auto")
+ *   7. first locally available backend in dsh → opencode → openai → anthropic
+ *   8. "dsh" (so the error message names a concrete runtime)
  *
- * Zero-config guarantee: with no config file and no env vars, everything
- * resolves to the built-in DSH backend — exactly the pre-v5 behavior.
+ * Nothing is ever auto-installed; unavailable backends fail explicitly.
  * ------------------------------------------------------------------ */
+
+export interface DshFileConfig {
+  command?: string;
+  profile?: string;
+}
+
+export interface OpenCodeFileConfig {
+  command?: string;
+  model?: string;
+  agent?: string;
+  auto_approve?: boolean;
+  args?: string[];
+}
+
+export interface OpenAIFileConfig {
+  api_key?: string;
+  api_key_env?: string;
+  base_url?: string;
+  model?: string;
+  api?: OpenAIApiStyle;
+  max_output_tokens?: number;
+  temperature?: number;
+  max_iterations?: number;
+}
+
+export interface AnthropicFileConfig {
+  api_key?: string;
+  api_key_env?: string;
+  base_url?: string;
+  model?: string;
+  api_version?: string;
+  max_output_tokens?: number;
+  temperature?: number;
+  max_iterations?: number;
+}
 
 export interface WorkforceFileConfig {
   default_backend?: string;
   backends?: {
-    dsh?: { command?: string; profile?: string };
+    dsh?: DshFileConfig;
+    opencode?: OpenCodeFileConfig;
+    openai?: OpenAIFileConfig;
+    anthropic?: AnthropicFileConfig;
+    /** Local test backend; no config required. */
+    fake?: Record<string, never>;
   };
   routing?: {
     default?: string;
@@ -52,34 +98,13 @@ export function loadFileConfig(configPath?: string): WorkforceFileConfig | null 
   }
 }
 
-function isExecutable(p: string): boolean {
-  try {
-    fs.accessSync(p, fs.constants.X_OK);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-function which(cmd: string): string | null {
-  try {
-    const out = execFileSync('/usr/bin/which', [cmd], {
-      encoding: 'utf8',
-      stdio: ['ignore', 'pipe', 'pipe'],
-    }).trim();
-    return out && isExecutable(out) ? out : null;
-  } catch {
-    return null;
-  }
-}
-
 export interface ResolvedDshExecutable {
   command: string | null;
-  source: 'config' | 'env' | 'env-legacy' | 'builtin-path' | 'path' | 'none';
+  source: 'config' | 'env' | 'builtin-path' | 'path' | 'none';
 }
 
 /**
- * Resolve the dsh executable without any required configuration:
+ * Resolve the dsh executable without required configuration:
  * explicit config/env → /usr/local/bin/dsh → dsh on PATH → unavailable.
  */
 export function resolveDshExecutable(
@@ -94,7 +119,6 @@ export function resolveDshExecutable(
 
   const env = process.env;
   if (env.WORKFORCE_DSH_COMMAND) return { command: env.WORKFORCE_DSH_COMMAND, source: 'env' };
-  if (env.KIMI_WORKER_DSH_BIN) return { command: env.KIMI_WORKER_DSH_BIN, source: 'env-legacy' };
 
   // config.dshBin carries the env-aware default already; treat explicit
   // non-default values as configured.
@@ -112,6 +136,8 @@ export interface RouteInput {
   mode?: string | undefined;
 }
 
+const AUTO_ORDER = ['dsh', 'opencode', 'openai', 'anthropic'] as const;
+
 export class BackendRegistry {
   private backends = new Map<string, WorkerBackend>();
   readonly defaultBackendId: string;
@@ -126,8 +152,15 @@ export class BackendRegistry {
 
     const env = opts.env ?? process.env;
     const fc = opts.fileConfig ?? null;
-    this.defaultBackendId =
-      fc?.routing?.default ?? fc?.default_backend ?? env.WORKFORCE_DEFAULT_BACKEND ?? defaultBackend.id;
+    const explicit =
+      fc?.routing?.default ??
+      fc?.default_backend ??
+      env.WORKFORCE_DEFAULT_BACKEND ??
+      undefined;
+    const id = explicit !== undefined && explicit !== '' && explicit !== 'auto'
+      ? explicit
+      : this.firstAvailable(explicit === 'auto' || explicit === undefined) ?? defaultBackend.id;
+    this.defaultBackendId = id;
     this.routingRoles = { ...(fc?.routing?.roles ?? {}) };
 
     if (!this.backends.has(this.defaultBackendId)) {
@@ -135,11 +168,20 @@ export class BackendRegistry {
         `default backend ${JSON.stringify(this.defaultBackendId)} is not registered (available: ${[...this.backends.keys()].join(', ')})`,
       );
     }
-    for (const [role, id] of Object.entries(this.routingRoles)) {
-      if (!this.backends.has(id)) {
-        throw new Error(`routing role ${JSON.stringify(role)} points at unknown backend ${JSON.stringify(id)}`);
+    for (const [role, id2] of Object.entries(this.routingRoles)) {
+      if (!this.backends.has(id2)) {
+        throw new Error(`routing role ${JSON.stringify(role)} points at unknown backend ${JSON.stringify(id2)}`);
       }
     }
+  }
+
+  private firstAvailable(allowAuto: boolean): string | null {
+    if (!allowAuto) return null;
+    for (const id of AUTO_ORDER) {
+      const b = this.backends.get(id);
+      if (b?.isAvailable()) return id;
+    }
+    return null;
   }
 
   register(backend: WorkerBackend): void {
@@ -181,8 +223,23 @@ export class BackendRegistry {
     if (!backend.isAvailable()) {
       if (backend.id === 'dsh') {
         throw new Error(
-          'Default backend "dsh" is unavailable: could not find /usr/local/bin/dsh or dsh in PATH. ' +
-            'Install DeepSeek Harness or set WORKFORCE_DSH_COMMAND.',
+          'backend "dsh" is unavailable: could not find /usr/local/bin/dsh or dsh in PATH. ' +
+            'Install DeepSeek Harness or set WORKFORCE_DSH_COMMAND (or choose another backend).',
+        );
+      }
+      if (backend.id === 'opencode') {
+        throw new Error(
+          'backend "opencode" is unavailable: executable not found. Install OpenCode or set WORKFORCE_OPENCODE_COMMAND.',
+        );
+      }
+      if (backend.id === 'openai') {
+        throw new Error(
+          'backend "openai" is unavailable: no API key. Set WORKFORCE_OPENAI_API_KEY (or OPENAI_API_KEY) and optionally WORKFORCE_OPENAI_MODEL.',
+        );
+      }
+      if (backend.id === 'anthropic') {
+        throw new Error(
+          'backend "anthropic" is unavailable: no API key. Set WORKFORCE_ANTHROPIC_API_KEY (or ANTHROPIC_API_KEY) and optionally WORKFORCE_ANTHROPIC_MODEL.',
         );
       }
       throw new Error(`backend "${backend.id}" is not available`);
@@ -191,15 +248,99 @@ export class BackendRegistry {
   }
 }
 
-/** Build the production registry with the zero-config DSH default. */
+function pickEnv(env: NodeJS.ProcessEnv, names: string[]): string | undefined {
+  for (const n of names) {
+    const v = env[n];
+    if (v !== undefined && v !== '') return v;
+  }
+  return undefined;
+}
+
+function parseNum(raw: string | undefined): number | undefined {
+  if (raw === undefined || raw === '') return undefined;
+  const n = Number(raw);
+  return Number.isFinite(n) ? n : undefined;
+}
+
+function normalizeOpenAiStyle(raw: string | undefined): OpenAIApiStyle {
+  if (raw === 'responses' || raw === 'response') return 'responses';
+  return 'chat_completions';
+}
+
+/** Build the production registry with dsh/opencode/openai/anthropic backends. */
 export function createDefaultRegistry(
   config: Config,
   opts: { extraBackends?: WorkerBackend[] | undefined; env?: NodeJS.ProcessEnv | undefined; configPath?: string | undefined } = {},
 ): BackendRegistry {
+  const env = opts.env ?? process.env;
   const fileConfig = loadFileConfig(opts.configPath);
+
+  // dsh
   const exe = resolveDshExecutable(config, fileConfig);
   const profile =
-    fileConfig?.backends?.dsh?.profile ?? opts.env?.WORKFORCE_DSH_PROFILE ?? process.env.WORKFORCE_DSH_PROFILE ?? config.dshProfile;
-  const dsh = new DshBackend({ dshBin: exe.command ?? '/usr/local/bin/dsh', profile });
-  return new BackendRegistry(dsh, { extraBackends: opts.extraBackends, fileConfig, env: opts.env });
+    fileConfig?.backends?.dsh?.profile ?? env.WORKFORCE_DSH_PROFILE ?? config.dshProfile;
+  const dsh = new DshBackend({ dshBin: exe.command ?? config.dshBin, profile });
+
+  // OpenCode
+  const oc = fileConfig?.backends?.opencode;
+  const ocCommand = oc?.command ?? env.WORKFORCE_OPENCODE_COMMAND ?? 'opencode';
+  const ocArgsRaw = env.WORKFORCE_OPENCODE_ARGS;
+  const opencode = new OpenCodeBackend({
+    command: ocCommand,
+    model: oc?.model ?? env.WORKFORCE_OPENCODE_MODEL,
+    agent: oc?.agent ?? env.WORKFORCE_OPENCODE_AGENT,
+    autoApprove: oc?.auto_approve ?? env.WORKFORCE_OPENCODE_AUTO !== 'false',
+    extraArgs: oc?.args ?? (ocArgsRaw ? ocArgsRaw.split(/\s+/).filter(Boolean) : []),
+  });
+
+  // OpenAI
+  const oa = fileConfig?.backends?.openai;
+  const oaKeyEnv = oa?.api_key_env;
+  const oaKey = oa?.api_key ?? (oaKeyEnv ? env[oaKeyEnv] : undefined) ?? pickEnv(env, ['WORKFORCE_OPENAI_API_KEY', 'OPENAI_API_KEY']) ?? '';
+  const oaBase = oa?.base_url ?? pickEnv(env, ['WORKFORCE_OPENAI_BASE_URL', 'OPENAI_BASE_URL']);
+  const openai = new OpenAIBackend({
+    apiKey: oaKey,
+    baseUrl: oaBase ?? 'https://api.openai.com/v1',
+    explicitBaseUrl: oaBase !== undefined,
+    model: oa?.model ?? pickEnv(env, ['WORKFORCE_OPENAI_MODEL', 'OPENAI_MODEL']) ?? 'gpt-4.1',
+    api: normalizeOpenAiStyle(oa?.api ?? pickEnv(env, ['WORKFORCE_OPENAI_API', 'OPENAI_API'])),
+    maxOutputTokens: oa?.max_output_tokens ?? parseNum(env.WORKFORCE_OPENAI_MAX_OUTPUT_TOKENS),
+    temperature: oa?.temperature ?? parseNum(env.WORKFORCE_OPENAI_TEMPERATURE),
+    maxIterations: oa?.max_iterations ?? parseNum(env.WORKFORCE_OPENAI_MAX_ITERATIONS),
+  });
+
+  // Anthropic
+  const an = fileConfig?.backends?.anthropic;
+  const anKeyEnv = an?.api_key_env;
+  const anKey = an?.api_key ?? (anKeyEnv ? env[anKeyEnv] : undefined) ?? pickEnv(env, ['WORKFORCE_ANTHROPIC_API_KEY', 'ANTHROPIC_API_KEY']) ?? '';
+  const anBase = an?.base_url ?? pickEnv(env, ['WORKFORCE_ANTHROPIC_BASE_URL', 'ANTHROPIC_BASE_URL']);
+  const anthropic = new AnthropicBackend({
+    apiKey: anKey,
+    baseUrl: anBase ?? 'https://api.anthropic.com',
+    explicitBaseUrl: anBase !== undefined,
+    model: an?.model ?? pickEnv(env, ['WORKFORCE_ANTHROPIC_MODEL', 'ANTHROPIC_MODEL']) ?? 'claude-sonnet-4-5',
+    apiVersion: an?.api_version ?? env.WORKFORCE_ANTHROPIC_VERSION,
+    maxOutputTokens: an?.max_output_tokens ?? parseNum(env.WORKFORCE_ANTHROPIC_MAX_OUTPUT_TOKENS),
+    temperature: an?.temperature ?? parseNum(env.WORKFORCE_ANTHROPIC_TEMPERATURE),
+    maxIterations: an?.max_iterations ?? parseNum(env.WORKFORCE_ANTHROPIC_MAX_ITERATIONS),
+  });
+
+  // Explicit WORKFORCE_BACKEND (non-auto) participates in routing unless a
+  // more specific config-file / env default is set.
+  const hasExplicitDefault =
+    fileConfig?.routing?.default !== undefined ||
+    fileConfig?.default_backend !== undefined ||
+    env.WORKFORCE_DEFAULT_BACKEND !== undefined;
+  const effectiveFileConfig =
+    config.backend !== 'auto' && !hasExplicitDefault
+      ? { ...(fileConfig ?? {}), default_backend: config.backend }
+      : fileConfig;
+
+  const fake = new FakeBackend({ scenario: () => FakeScenarios.success() });
+
+  return new BackendRegistry(dsh, {
+    extraBackends: [opencode, openai, anthropic, fake, ...(opts.extraBackends ?? [])],
+    fileConfig: effectiveFileConfig,
+    env,
+  });
 }

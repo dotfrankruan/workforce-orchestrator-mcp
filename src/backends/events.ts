@@ -35,6 +35,8 @@ export function normalizeDshEvent(ev: DshEvent): WorkerEvent[] {
       return [{ type: 'session', sessionId: ev.sessionId, cwd: ev.cwd, offset }];
     case 'status': {
       const out: WorkerEvent[] = [];
+      // A status line may also carry the session id (e.g. OpenCode step_start).
+      if (ev.sessionId) out.push({ type: 'session', sessionId: ev.sessionId, cwd: ev.cwd, offset });
       if (ev.phase) out.push({ type: 'status', phase: ev.phase, turn: ev.turn, step: ev.step, offset });
       if (ev.usage) {
         out.push({
@@ -58,6 +60,8 @@ export function normalizeDshEvent(ev: DshEvent): WorkerEvent[] {
       return [{ type: 'tool_result', callId: ev.callId, status: ev.status, offset }];
     case 'final':
       return ev.text !== undefined ? [{ type: 'final', text: ev.text, offset }] : [];
+    case 'error':
+      return [{ type: 'error', message: ev.message ?? (ev.rawLine ?? 'backend error'), offset }];
     default:
       if (ev.malformed) return [{ type: 'malformed', preview: (ev.rawLine ?? '').slice(0, 200), offset }];
       return [];

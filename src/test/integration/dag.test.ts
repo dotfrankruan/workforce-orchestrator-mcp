@@ -278,7 +278,7 @@ test('git workflow: sequential code tasks commit onto one workflow branch', asyn
 
     const result = h.supervisor.workflowResult(wf.workflow_id) as Record<string, any>;
     const branch = result['git']['integration_branch'] as string;
-    assert.match(branch, /^kimi-workflow\/wf_/);
+    assert.match(branch, /^workforce\/workflow\/wf_/);
     assert.equal(result['git']['tasks_integrated'], 2);
     assert.equal(result['git']['integration_conflicts'], 0);
     assert.equal(result['git']['working_tree_clean'], true);

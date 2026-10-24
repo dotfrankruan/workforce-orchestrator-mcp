@@ -15,7 +15,7 @@ function newWorker(id: string, overrides: Partial<Parameters<WorkerStore['create
     id,
     repo_path: '/tmp/repo',
     base_ref: 'a'.repeat(40),
-    branch: `kimi-worker/${id}`,
+    branch: `workforce/worker/${id}`,
     worktree_path: `/tmp/wt/${id}`,
     log_dir: `/tmp/wt/${id}`,
     task: 'do the thing',

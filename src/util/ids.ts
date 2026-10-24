@@ -13,5 +13,5 @@ export function isValidWorkerId(id: string): boolean {
 
 /** Branch name used for a worker's worktree. */
 export function workerBranch(workerId: string): string {
-  return `kimi-worker/${workerId}`;
+  return `workforce/worker/${workerId}`;
 }

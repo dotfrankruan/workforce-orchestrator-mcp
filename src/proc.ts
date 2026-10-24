@@ -21,8 +21,11 @@ export function captureProcessIdentity(pid: number): ProcessIdentity | null {
       stdio: ['ignore', 'pipe', 'pipe'],
     }).trim();
     if (!out) return null;
-    // lstart has a fixed width (5 tokens: "Tue Sep 30 16:20:01 2026"); the rest is command.
-    const m = /^(\w{3}\s+\w{3}\s+\d+\s+\d{2}:\d{2}:\d{2}\s+\d{4})\s+(.*)$/.exec(out);
+    // lstart is 5 tokens, but BSD/macOS orders them as
+    // "Sat 24 Oct 13:40:42 2026" while GNU/Linux uses
+    // "Tue Sep 30 16:20:01 2026". Accept both; the rest is the command.
+    const m =
+      /^(\w{3}\s+(?:\w{3}\s+\d+|\d+\s+\w{3})\s+\d{2}:\d{2}:\d{2}\s+\d{4})\s+(.*)$/.exec(out);
     if (!m) return null;
     return { startToken: m[1]!, command: m[2] ?? '' };
   } catch {

@@ -13,7 +13,7 @@ test('full lifecycle: spawn → worktree → commit → compact result', async (
     const spawn = h.supervisor.spawn({ repo_path: repo, task: 'add a feature file' });
     assert.equal(spawn.status, 'queued');
     assert.match(spawn.worker_id, /^wk_[0-9a-f]{8}$/);
-    assert.equal(spawn.branch, `kimi-worker/${spawn.worker_id}`);
+    assert.equal(spawn.branch, `workforce/worker/${spawn.worker_id}`);
 
     const row = await h.supervisor.waitFor(spawn.worker_id);
     assert.equal(row.status, 'completed');
@@ -26,7 +26,7 @@ test('full lifecycle: spawn → worktree → commit → compact result', async (
 
     // Worktree and branch exist.
     assert.ok(fs.existsSync(path.join(spawn.worktree, 'feature.txt')));
-    const branches = git(['branch', '--list', 'kimi-worker/*'], repo);
+    const branches = git(['branch', '--list', 'workforce/worker/*'], repo);
     assert.ok(branches.includes(spawn.branch));
 
     // Main working tree untouched.

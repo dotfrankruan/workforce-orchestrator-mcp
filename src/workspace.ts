@@ -177,7 +177,7 @@ export function planWorkflowWorkspace(
     const { repoRoot } = validateRepoPath(input.repo_path);
     const baseSha = resolveRef(repoRoot, input.base_ref ?? 'HEAD');
     // The workflow-level workspace is the INTEGRATION worktree (branch
-    // kimi-workflow/<id>). Every task gets its own worktree+branch under
+    // workforce/workflow/<id>). Every task gets its own worktree+branch under
     // logDir/tasks/<taskId>/ — workers never touch the integration worktree.
     return {
       type,
@@ -186,7 +186,7 @@ export function planWorkflowWorkspace(
       logDir,
       repoPath: repoRoot,
       baseRef: baseSha,
-      branch: `kimi-workflow/${workflowId}`,
+      branch: `workforce/workflow/${workflowId}`,
     };
   }
   if (type === 'directory') {

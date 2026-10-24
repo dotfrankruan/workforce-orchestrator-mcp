@@ -1,12 +1,12 @@
 {
-  "name": "kimi-workforce-mcp",
-  "version": "0.2.0",
-  "description": "MCP server that lets Codex delegate coding/research/data/docs/file/ops/review tasks to DeepSeek Harness (Kimi) workers",
+  "name": "workforce-orchestrator-mcp",
+  "version": "0.3.0",
+  "description": "Universal MCP orchestrator that lets Codex delegate coding/research/data/docs/file/ops/review tasks to pluggable runtime backends (DeepSeek Harness, OpenCode) or direct OpenAI/Anthropic APIs",
   "license": "Apache-2.0",
   "type": "module",
   "bin": {
-    "kimi-worker-mcp": "./dist/cli.js",
-    "kimi-workforce-mcp": "./dist/cli.js"
+    "workforce-mcp": "./dist/cli.js",
+    "workforce-orchestrator-mcp": "./dist/cli.js"
   },
   "main": "./dist/index.js",
   "files": [

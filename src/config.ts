@@ -2,7 +2,15 @@ import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs';
 
-export type BackendKind = 'dsh' | 'fake';
+/**
+ * Backend kind selected by environment/config.
+ *
+ * - `auto` (default): first available backend in the deterministic order
+ *   dsh → opencode → openai → anthropic, then `dsh` as the documented fallback.
+ * - explicit ids select one backend; availability is validated at spawn time.
+ * - `fake` is a local test backend (no API calls).
+ */
+export type BackendKind = 'auto' | 'dsh' | 'opencode' | 'openai' | 'anthropic' | 'fake';
 
 export interface Config {
   /** Path to the dsh binary. Never invoked through a shell. */
@@ -19,7 +27,7 @@ export interface Config {
   defaultTimeoutSeconds: number;
   /** Hard upper bound for a caller-provided timeout. */
   maxTimeoutSeconds: number;
-  /** Worker backend implementation. */
+  /** Worker backend implementation (auto = first locally available). */
   backend: BackendKind;
   /** Max bytes returned by get_worker_log. */
   logMaxBytes: number;
@@ -29,8 +37,8 @@ export interface Config {
   finalTextMaxChars: number;
   /** Grace period (ms) between SIGTERM and SIGKILL on cancel. */
   terminateGraceMs: number;
-  /** Experimental: allow research/general workers to use dsh subagents. */
-  enableDshSubagents: boolean;
+  /** Experimental: allow research/general workers to delegate to subagents. */
+  enableSubagents: boolean;
   maxSubagentDepth: number;
   maxSubagentsPerTask: number;
 }
@@ -41,15 +49,17 @@ const DEFAULTS = {
   maxConcurrent: 4,
   defaultTimeoutSeconds: 3600,
   maxTimeoutSeconds: 6 * 3600,
-  backend: 'dsh' as BackendKind,
+  backend: 'auto' as BackendKind,
   logMaxBytes: 32 * 1024,
   diffMaxBytes: 64 * 1024,
   finalTextMaxChars: 8000,
   terminateGraceMs: 5000,
-  enableDshSubagents: false,
+  enableSubagents: false,
   maxSubagentDepth: 1,
   maxSubagentsPerTask: 3,
 };
+
+const BACKEND_KINDS: readonly BackendKind[] = ['auto', 'dsh', 'opencode', 'openai', 'anthropic', 'fake'];
 
 function parsePositiveInt(name: string, raw: string | undefined, fallback: number): number {
   if (raw === undefined || raw === '') return fallback;
@@ -62,8 +72,11 @@ function parsePositiveInt(name: string, raw: string | undefined, fallback: numbe
 
 function parseBackend(raw: string | undefined): BackendKind {
   if (raw === undefined || raw === '') return DEFAULTS.backend;
-  if (raw === 'dsh' || raw === 'fake') return raw;
-  throw new Error(`Invalid KIMI_WORKER_BACKEND: ${JSON.stringify(raw)} (expected "dsh" or "fake")`);
+  const normalized = raw.trim().toLowerCase();
+  if ((BACKEND_KINDS as readonly string[]).includes(normalized)) return normalized as BackendKind;
+  throw new Error(
+    `Invalid WORKFORCE_BACKEND: ${JSON.stringify(raw)} (expected one of ${BACKEND_KINDS.join(', ')})`,
+  );
 }
 
 function expandHome(p: string): string {
@@ -79,62 +92,67 @@ export interface ConfigOverrides {
 
 /**
  * Build a Config from environment variables (with optional explicit overrides,
- * mainly for tests). Never reads ~/.dsh/.env — credentials are dsh's business.
+ * mainly for tests). Credentials for direct API backends are read by those
+ * backends from the environment/config and are never printed.
  */
 export function loadConfig(overrides: ConfigOverrides = {}): Config {
   const env = overrides.env ?? process.env;
 
   const workerRootRaw =
-    overrides.workerRoot ?? env.KIMI_WORKER_ROOT ?? path.join(os.homedir(), '.kimi-workers');
+    overrides.workerRoot ?? env.WORKFORCE_ROOT ?? path.join(os.homedir(), '.workforce', 'workers');
   const workerRoot = path.resolve(expandHome(workerRootRaw));
 
-  const dbPath = path.resolve(expandHome(env.KIMI_WORKER_DB ?? path.join(workerRoot, 'workers.db')));
+  const dbPath = path.resolve(expandHome(env.WORKFORCE_DB ?? path.join(workerRoot, 'workers.db')));
 
   const maxConcurrent = parsePositiveInt(
-    'KIMI_WORKER_MAX_CONCURRENT',
-    env.KIMI_WORKER_MAX_CONCURRENT,
+    'WORKFORCE_MAX_CONCURRENT',
+    env.WORKFORCE_MAX_CONCURRENT,
     DEFAULTS.maxConcurrent,
   );
   const defaultTimeoutSeconds = parsePositiveInt(
-    'KIMI_WORKER_DEFAULT_TIMEOUT',
-    env.KIMI_WORKER_DEFAULT_TIMEOUT,
+    'WORKFORCE_DEFAULT_TIMEOUT',
+    env.WORKFORCE_DEFAULT_TIMEOUT,
     DEFAULTS.defaultTimeoutSeconds,
   );
   const maxTimeoutSeconds = parsePositiveInt(
-    'KIMI_WORKER_MAX_TIMEOUT',
-    env.KIMI_WORKER_MAX_TIMEOUT,
+    'WORKFORCE_MAX_TIMEOUT',
+    env.WORKFORCE_MAX_TIMEOUT,
     DEFAULTS.maxTimeoutSeconds,
   );
   if (defaultTimeoutSeconds > maxTimeoutSeconds) {
-    throw new Error('KIMI_WORKER_DEFAULT_TIMEOUT must not exceed KIMI_WORKER_MAX_TIMEOUT');
+    throw new Error('WORKFORCE_DEFAULT_TIMEOUT must not exceed WORKFORCE_MAX_TIMEOUT');
   }
 
   const config: Config = {
-    dshBin: env.KIMI_WORKER_DSH_BIN ?? DEFAULTS.dshBin,
-    dshProfile: env.KIMI_WORKER_DSH_PROFILE ?? DEFAULTS.dshProfile,
+    dshBin: env.WORKFORCE_DSH_COMMAND ?? DEFAULTS.dshBin,
+    dshProfile: env.WORKFORCE_DSH_PROFILE ?? DEFAULTS.dshProfile,
     workerRoot,
     dbPath,
     maxConcurrent,
     defaultTimeoutSeconds,
     maxTimeoutSeconds,
-    backend: parseBackend(env.KIMI_WORKER_BACKEND),
-    logMaxBytes: parsePositiveInt('KIMI_WORKER_LOG_MAX_BYTES', env.KIMI_WORKER_LOG_MAX_BYTES, DEFAULTS.logMaxBytes),
-    diffMaxBytes: parsePositiveInt('KIMI_WORKER_DIFF_MAX_BYTES', env.KIMI_WORKER_DIFF_MAX_BYTES, DEFAULTS.diffMaxBytes),
+    backend: parseBackend(env.WORKFORCE_BACKEND),
+    logMaxBytes: parsePositiveInt('WORKFORCE_LOG_MAX_BYTES', env.WORKFORCE_LOG_MAX_BYTES, DEFAULTS.logMaxBytes),
+    diffMaxBytes: parsePositiveInt('WORKFORCE_DIFF_MAX_BYTES', env.WORKFORCE_DIFF_MAX_BYTES, DEFAULTS.diffMaxBytes),
     finalTextMaxChars: parsePositiveInt(
-      'KIMI_WORKER_FINAL_TEXT_MAX_CHARS',
-      env.KIMI_WORKER_FINAL_TEXT_MAX_CHARS,
+      'WORKFORCE_FINAL_TEXT_MAX_CHARS',
+      env.WORKFORCE_FINAL_TEXT_MAX_CHARS,
       DEFAULTS.finalTextMaxChars,
     ),
     terminateGraceMs: parsePositiveInt(
-      'KIMI_WORKER_TERMINATE_GRACE_MS',
-      env.KIMI_WORKER_TERMINATE_GRACE_MS,
+      'WORKFORCE_TERMINATE_GRACE_MS',
+      env.WORKFORCE_TERMINATE_GRACE_MS,
       DEFAULTS.terminateGraceMs,
     ),
-    enableDshSubagents: env.ENABLE_DSH_SUBAGENTS === 'true',
-    maxSubagentDepth: parsePositiveInt('MAX_SUBAGENT_DEPTH', env.MAX_SUBAGENT_DEPTH, DEFAULTS.maxSubagentDepth),
+    enableSubagents: env.WORKFORCE_ENABLE_SUBAGENTS === 'true',
+    maxSubagentDepth: parsePositiveInt(
+      'WORKFORCE_MAX_SUBAGENT_DEPTH',
+      env.WORKFORCE_MAX_SUBAGENT_DEPTH,
+      DEFAULTS.maxSubagentDepth,
+    ),
     maxSubagentsPerTask: parsePositiveInt(
-      'MAX_SUBAGENTS_PER_TASK',
-      env.MAX_SUBAGENTS_PER_TASK,
+      'WORKFORCE_MAX_SUBAGENTS_PER_TASK',
+      env.WORKFORCE_MAX_SUBAGENTS_PER_TASK,
       DEFAULTS.maxSubagentsPerTask,
     ),
   };

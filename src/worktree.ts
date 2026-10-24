@@ -148,7 +148,7 @@ export function supervisorCommitAll(worktreePath: string, message: string): Supe
 
   const identityArgs = hasIdentity(worktreePath)
     ? []
-    : ['-c', 'user.name=Kimi Workforce', '-c', 'user.email=kimi-workforce@localhost'];
+    : ['-c', 'user.name=Workforce Orchestrator', '-c', 'user.email=workforce@localhost'];
 
   try {
     runGit([...identityArgs, 'commit', '-m', message], worktreePath);

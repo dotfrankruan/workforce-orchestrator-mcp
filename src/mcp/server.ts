@@ -10,7 +10,7 @@ import type { WorkerRow } from '../db.js';
  * Server-level instructions, returned in the MCP initialize result.
  * Keep the most important guidance first; stay concise.
  */
-export const SERVER_INSTRUCTIONS = `The Workforce Orchestrator is Codex's preferred execution backend for substantial, context-heavy, tool-heavy, or parallelizable work. Runtime backends are pluggable (default: DeepSeek Harness); providers/credentials belong to the runtime — never assume a specific provider. Codex remains responsible for understanding the user's goal, planning, architecture, task decomposition, reviewing worker output, validating important claims, and final integration — the human user always has final control over intent.
+export const SERVER_INSTRUCTIONS = `The Workforce Orchestrator is Codex's preferred execution backend for substantial, context-heavy, tool-heavy, or parallel work. Runtime backends are pluggable (dsh, opencode, or direct OpenAI/Anthropic APIs); credentials belong to the backend — never assume a provider. Codex remains responsible for understanding the user's goal, planning, architecture, task decomposition, reviewing worker output, validating important claims, and final integration — the human user always has final control over intent.
 
 Delegate execution-heavy work when useful: repo exploration; multi-file implementation; test/debug cycles; long tool workflows; web research; data analysis; docs; bulk file processing; independent review; parallelizable subtasks. Do not delegate trivial one-step work. Use Codex-native subagents for high-cognition independent reasoning or adversarial review; use this workforce for execution-heavy, artifact-producing, or parallel work. Codex root retains planning and final integration.
 
@@ -76,16 +76,16 @@ const MODE_DESC =
 
 export function createMcpServer(supervisor: WorkerSupervisor): McpServer {
   const server = new McpServer(
-    { name: 'kimi-workforce-mcp', version: '0.2.0' },
+    { name: 'workforce-orchestrator-mcp', version: '0.3.0' },
     { capabilities: { logging: {} }, instructions: SERVER_INSTRUCTIONS },
   );
 
   server.registerTool(
     'spawn_task',
     {
-      title: 'Spawn Kimi task (any mode)',
+      title: 'Spawn Workforce task (any mode)',
       description:
-        'Delegate substantial execution work to a Kimi K3 worker.\n\n' +
+        'Delegate substantial execution work to a worker.\n\n' +
         'Use proactively when a task involves significant repository exploration, implementation, testing/debugging, long tool trajectories, research, data analysis, documentation, file processing, independent review, or work that can beneficially run in parallel. Multiple independent tasks may run in parallel.\n\n' +
         'Codex should normally retain planning, architectural decisions, review, validation, and final integration.\n\n' +
         'Avoid using this tool for tiny edits or trivial one-step operations where delegation overhead exceeds the task. If delegated execution repeatedly fails and its retry policy is exhausted, return control to the human instead of silently substituting expensive Codex-side execution.\n\n' +
@@ -109,7 +109,7 @@ export function createMcpServer(supervisor: WorkerSupervisor): McpServer {
         deliverables: z.array(z.string()).optional().describe(DELIVERABLES_DESC),
         capabilities: z.array(z.string()).optional().describe(CAPABILITIES_DESC),
         timeout_seconds: z.number().int().positive().optional().describe(TIMEOUT_DESC),
-        backend: z.string().optional().describe('Runtime backend id (see list_backends). Default: router resolves to the configured default — the built-in dsh backend when nothing is configured.'),
+        backend: z.string().optional().describe('Runtime backend id (see list_backends). Default: "auto" selects the configured default or the first locally available backend (dsh, opencode, openai, anthropic).'),
       },
       annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
     },
@@ -222,7 +222,7 @@ export function createMcpServer(supervisor: WorkerSupervisor): McpServer {
   server.registerTool(
     'spawn_tasks',
     {
-      title: 'Spawn multiple Kimi tasks',
+      title: 'Spawn multiple Workforce tasks',
       description:
         'Batch-spawn several independent tasks in one call (each gets its own workspace and session). Combine with wait_tasks for parallel delegation: spawn_tasks → do Codex-side work → wait_tasks(return_when="all") → review each result.\n\n' +
         'Per-item success/error is returned; one invalid item does not roll back the others.',
@@ -265,7 +265,7 @@ export function createMcpServer(supervisor: WorkerSupervisor): McpServer {
     {
       title: 'Create workflow (task DAG)',
       description:
-        'Create a multi-task workflow: a dependency DAG of Kimi tasks sharing one workspace. Dependencies reference per-task keys (not ids); cycles are rejected. Tasks without dependencies start immediately (parallel), dependents start automatically when their dependencies complete (all_success) or terminate (all_terminal).\n\n' +
+        'Create a multi-task workflow: a dependency DAG of Workforce tasks sharing one workspace. Dependencies reference per-task keys (not ids); cycles are rejected. Tasks without dependencies start immediately (parallel), dependents start automatically when their dependencies complete (all_success) or terminate (all_terminal).\n\n' +
         'Use for multi-track delegated work: research → implement → test → review pipelines, parallel analysis with a synthesis step, etc. Then wait_workflow / get_workflow_result.\n\n' +
         'failure_policy: stop_dependents (default; downstream of a failed task is blocked) | continue (independent branches proceed; all_terminal dependents still run) | cancel_remaining. If delegated execution repeatedly fails and retries are exhausted, return control to the human rather than silently substituting Codex-side execution.',
       inputSchema: {
@@ -288,7 +288,7 @@ export function createMcpServer(supervisor: WorkerSupervisor): McpServer {
                   max_duration_seconds: z.number().int().positive().optional(),
                   max_input_tokens: z.number().int().positive().optional(),
                   max_output_tokens: z.number().int().positive().optional(),
-                  max_total_tokens: z.number().int().positive().optional().describe('input+output+cache_read, checked per DSH status event (best-effort, not hard accounting)'),
+                  max_total_tokens: z.number().int().positive().optional().describe('input+output+cache_read, checked per backend status event (best-effort, not hard accounting)'),
                   max_tool_calls: z.number().int().positive().optional(),
                   max_iterations: z.number().int().positive().optional(),
                 })
@@ -315,7 +315,7 @@ export function createMcpServer(supervisor: WorkerSupervisor): McpServer {
         budget: z
           .object({
             max_duration_seconds: z.number().int().positive().optional(),
-            max_kimi_tokens: z.number().int().positive().optional().describe('Sum of input+output+cache_read tokens across all workflow tasks (best-effort).'),
+            max_worker_tokens: z.number().int().positive().optional().describe('Sum of input+output+cache_read tokens across all workflow tasks (best-effort).'),
             max_concurrent_tasks: z.number().int().positive().optional(),
             max_tasks: z.number().int().positive().optional(),
           })
@@ -467,7 +467,7 @@ export function createMcpServer(supervisor: WorkerSupervisor): McpServer {
         budget: z
           .object({
             max_duration_seconds: z.number().int().positive().optional(),
-            max_kimi_tokens: z.number().int().positive().optional(),
+            max_worker_tokens: z.number().int().positive().optional(),
             max_concurrent_tasks: z.number().int().positive().optional(),
             max_tasks: z.number().int().positive().optional(),
           })
@@ -711,10 +711,10 @@ export function createMcpServer(supervisor: WorkerSupervisor): McpServer {
   server.registerTool(
     'spawn_worker',
     {
-      title: 'Spawn Kimi code worker (legacy)',
+      title: 'Spawn Workforce code worker (legacy)',
       description:
         '[Legacy alias of spawn_task with mode=code and a git_worktree workspace — prefer spawn_task for new work.]\n\n' +
-        'Delegate a substantial coding task to a Kimi K3 worker: it runs in an isolated git worktree on its own branch, explores the repo, implements, and runs/debugs tests autonomously. The workforce supervisor verifies and commits successful changes onto the worker branch automatically. Use for implementation work spanning multiple files or long test/debug trajectories; avoid for tiny one-line edits.\n\n' +
+        'Delegate a substantial coding task to a worker: it runs in an isolated git worktree on its own branch, explores the repo, implements, and runs/debugs tests autonomously. The workforce supervisor verifies and commits successful changes onto the worker branch automatically. Use for implementation work spanning multiple files or long test/debug trajectories; avoid for tiny one-line edits.\n\n' +
         'Returns immediately; when the result is needed use wait_task (not get_worker polling), then review get_worker_result / get_worker_diff. The server never merges or pushes — Codex decides whether to accept the branch.',
       inputSchema: {
         repo_path: z.string().describe('Absolute path inside the target git repository.'),
@@ -788,7 +788,7 @@ export function createMcpServer(supervisor: WorkerSupervisor): McpServer {
     {
       title: 'Continue worker session',
       description:
-        'Continue an existing delegated task in the same Kimi/DSH session and the same workspace.\n\n' +
+        'Continue an existing delegated task in the same worker backend session and the same workspace.\n\n' +
         'Prefer this when Codex reviews worker output and finds problems, missing requirements, failed tests, or additional closely-related work. For substantial corrections to worker-owned execution, prefer continuing the existing task rather than recreating the work from scratch.\n\n' +
         'The task must be in a terminal state and have a recorded session; it re-queues and runs again with the follow-up instruction.',
       inputSchema: {
@@ -907,5 +907,5 @@ export async function serveStdio(supervisor: WorkerSupervisor): Promise<void> {
   const transport = new StdioServerTransport();
   await server.connect(transport);
   // Keep the process alive; stderr is safe for diagnostics on stdio transport.
-  process.stderr.write('kimi-worker-mcp: MCP server listening on stdio\n');
+  process.stderr.write('workforce-mcp: MCP server listening on stdio\n');
 }

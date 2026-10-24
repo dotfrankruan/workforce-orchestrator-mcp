@@ -8,9 +8,10 @@ import type { TaskMode } from '../modes.js';
  * Three distinct concepts, never conflated:
  *   Orchestrator — this MCP (scheduling, DAG, git, budgets, metrics)
  *   Runtime backend — the process that executes tasks (e.g. DeepSeek Harness)
- *   Model provider — whoever the runtime is configured to call (e.g. Kimi)
+ *   Model provider — whoever the runtime is configured to call (e.g. OpenAI, Anthropic)
  *
- * The orchestrator never reads provider credentials; runtimes own those.
+ * Runtime backends normally own their credentials; direct API backends read
+ * only their explicitly configured API-key environment variables.
  * ------------------------------------------------------------------ */
 
 export interface BackendStartOptions {
@@ -81,6 +82,13 @@ export interface WorkerBackend {
   isAvailable(): boolean;
   /** Optional runtime/provider facts known without contacting the provider. */
   metadata?(): BackendMetadata;
+  /**
+   * Parse one durable stdout line into the normalized raw event shape.
+   * Defaults to the DSH JSONL parser. Backends whose wire format differs
+   * (e.g. OpenCode) override this so durable logs remain backend-agnostic.
+   * May return canonical `{type:"final"}` lines emitted by the backend itself.
+   */
+  parseLine?(line: string): DshEvent | null;
   start(opts: BackendStartOptions, events: BackendEvents): WorkerBackendHandle;
   /** Adapt one raw backend event into normalized worker events (may drop:
    *  thinking never reaches the supervisor). */

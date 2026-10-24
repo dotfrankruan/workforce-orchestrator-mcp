@@ -25,13 +25,14 @@ export type DshEventType =
   | 'tool_call'
   | 'tool_result'
   | 'final'
+  | 'error'
   | 'unknown';
 
 export interface DshUsage {
-  inputTokens?: number;
-  outputTokens?: number;
-  totalTokens?: number;
-  cacheReadTokens?: number;
+  inputTokens?: number | undefined;
+  outputTokens?: number | undefined;
+  totalTokens?: number | undefined;
+  cacheReadTokens?: number | undefined;
 }
 
 export interface DshEvent {
@@ -47,6 +48,8 @@ export interface DshEvent {
   callId?: string;
   tool?: string;
   status?: string;
+  /** Human-readable error message for backend error events. */
+  message?: string;
   /** Present when the raw line was not valid JSON. */
   malformed?: boolean;
   rawLine?: string;
@@ -54,7 +57,7 @@ export interface DshEvent {
   byteOffset?: number;
 }
 
-const KNOWN_TYPES = new Set(['session', 'status', 'thinking', 'text', 'tool_call', 'tool_result', 'final']);
+const KNOWN_TYPES = new Set(['session', 'status', 'thinking', 'text', 'tool_call', 'tool_result', 'final', 'error']);
 
 export interface ParseOptions {
   /** Max raw line length kept for malformed lines. */
@@ -97,6 +100,15 @@ export function parseDshLine(line: string, opts: ParseOptions = {}): DshEvent | 
   if (typeof rec.callId === 'string') ev.callId = rec.callId;
   if (typeof rec.tool === 'string') ev.tool = rec.tool;
   if (typeof rec.status === 'string') ev.status = rec.status;
+  if (typeof rec.message === 'string') ev.message = rec.message;
+  else if (typeof rec.error === 'string') ev.message = rec.error;
+  else if (typeof rec.error === 'object' && rec.error !== null) {
+    const e = rec.error as Record<string, unknown>;
+    const data = typeof e.data === 'object' && e.data !== null ? (e.data as Record<string, unknown>) : null;
+    if (typeof data?.message === 'string') ev.message = data.message;
+    else if (typeof e.message === 'string') ev.message = e.message;
+    else if (typeof e.name === 'string') ev.message = e.name;
+  }
 
   if (typeof rec.usage === 'object' && rec.usage !== null) {
     const u = rec.usage as Record<string, unknown>;
@@ -164,6 +176,8 @@ export function renderLogLine(ev: DshEvent, maxTextChars = 300): string {
       return `[tool_result] ${ev.status ?? '?'} (${ev.callId ?? '?'})`;
     case 'final':
       return `[final] ${clip(ev.text ?? '')}`;
+    case 'error':
+      return `[error] ${clip(ev.message ?? '')}`;
     default:
       return ev.malformed ? `[malformed] ${clip(ev.rawLine ?? '')}` : `[${ev.rawType}]`;
   }
@@ -187,8 +201,14 @@ export interface LogReplay {
   hasFinal: boolean;
 }
 
-/** Replay a stored stdout.jsonl to recover session, usage, counters, offset. */
-export function replayLogFile(path: string): LogReplay {
+/**
+ * Replay a stored stdout.jsonl to recover session, usage, counters, offset.
+ * `parser` lets non-DSH backends supply their own line decoder.
+ */
+export function replayLogFile(
+  path: string,
+  parser: (line: string) => DshEvent | null = parseDshLine,
+): LogReplay {
   const usage = new UsageTracker();
   const out: LogReplay = {
     sessionId: null,
@@ -210,7 +230,7 @@ export function replayLogFile(path: string): LogReplay {
     return out;
   }
   for (const line of content.split('\n')) {
-    const ev = parseDshLine(line);
+    const ev = parser(line);
     if (!ev) continue;
     out.eventCount++;
     if (ev.malformed) out.malformedCount++;

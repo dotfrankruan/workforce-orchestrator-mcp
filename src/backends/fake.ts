@@ -9,7 +9,7 @@ import type { DshEvent } from '../parser.js';
 
 /**
  * FakeWorkerBackend — simulates a dsh run for tests and local development,
- * without calling the real Kimi API.
+ * without calling a real provider API.
  *
  * A scenario is a list of steps executed in order. Steps can emit events,
  * write files into the worktree, make git commits, sleep, or hang forever
@@ -210,7 +210,7 @@ export const FakeScenarios = {
         { emit: { type: 'status', phase: 'turn_start', turn: 1 } },
         { writeFile: { path: file, content } },
         { git: ['add', '-A'] },
-        { git: ['-c', 'user.name=kimi-worker', '-c', 'user.email=kimi-worker@localhost', 'commit', '-m', message] },
+        { git: ['-c', 'user.name=workforce-worker', '-c', 'user.email=workforce-worker@localhost', 'commit', '-m', message] },
         {
           emit: {
             type: 'status',

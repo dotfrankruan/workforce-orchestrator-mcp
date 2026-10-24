@@ -1,4 +1,4 @@
-// Real DSH smoke: two parallel tiny Kimi tasks + wait_tasks(all).
+// Real DSH smoke: two parallel worker tasks + wait_tasks(all).
 // Verifies lifecycle and waiting only — each task gets its own isolated
 // temporary workspace. Usage: node scripts/wait-e2e.mjs
 import { spawn } from 'node:child_process';
@@ -9,7 +9,7 @@ import readline from 'node:readline';
 
 const workerRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'kwm-wait-root-'));
 const server = spawn(process.execPath, ['dist/cli.js', 'serve'], {
-  env: { ...process.env, KIMI_WORKER_ROOT: workerRoot },
+  env: { ...process.env, WORKFORCE_ROOT: workerRoot },
   stdio: ['pipe', 'pipe', 'inherit'],
 });
 
@@ -49,7 +49,7 @@ try {
   });
   console.log('✓ initialize (instructions:', init.result.instructions ? 'present' : 'MISSING', ')');
 
-  console.log('→ spawning two parallel real Kimi tasks…');
+  console.log('→ spawning two parallel real worker tasks…');
   const batch = await tool('spawn_tasks', {
     tasks: [
       { task: 'Create a file named A.txt containing exactly the letter A. Nothing else.', mode: 'general', timeout_seconds: 240 },

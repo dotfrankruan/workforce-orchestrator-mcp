@@ -49,8 +49,8 @@ export function makeHarness(
   const root = makeTempDir('kwm-root-');
   const config = loadConfig({
     env: {
-      KIMI_WORKER_MAX_CONCURRENT: String(overrides.maxConcurrent ?? 4),
-      KIMI_WORKER_TERMINATE_GRACE_MS: '200',
+      WORKFORCE_MAX_CONCURRENT: String(overrides.maxConcurrent ?? 4),
+      WORKFORCE_TERMINATE_GRACE_MS: '200',
     },
     workerRoot: root,
   });
@@ -86,8 +86,8 @@ export function makeProcHarness(
   const root = makeTempDir('kwm-root-');
   const config = loadConfig({
     env: {
-      KIMI_WORKER_MAX_CONCURRENT: String(overrides.maxConcurrent ?? 4),
-      KIMI_WORKER_TERMINATE_GRACE_MS: '200',
+      WORKFORCE_MAX_CONCURRENT: String(overrides.maxConcurrent ?? 4),
+      WORKFORCE_TERMINATE_GRACE_MS: '200',
     },
     workerRoot: root,
   });
@@ -134,7 +134,7 @@ export interface ProcStep {
   write?: { path: string; content: string };
 }
 
-const CHILD_MARKER = 'kimi-worker-proc-script';
+const CHILD_MARKER = 'workforce-worker-proc-script';
 
 /**
  * The child writes DSH-shaped JSONL to its stdout (which the backend pipes

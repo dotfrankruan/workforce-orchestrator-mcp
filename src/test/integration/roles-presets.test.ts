@@ -170,7 +170,7 @@ test('run_workflow_preset: bug_fix on a repo walks the full chain', async () => 
     assert.equal(done['status'], 'completed');
     const result = h.supervisor.workflowResult(res['workflow_id']) as Record<string, any>;
     assert.equal(result['tasks']['completed'], 4);
-    assert.ok(result['git']['integration_branch'].startsWith('kimi-workflow/wf_'));
+    assert.ok(result['git']['integration_branch'].startsWith('workforce/workflow/wf_'));
     // Each task wrote the same two files with identical content — only the
     // first task produces new commits; artifacts are indexed from the task
     // that actually changed them.

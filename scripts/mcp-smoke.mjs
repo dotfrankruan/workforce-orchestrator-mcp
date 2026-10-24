@@ -1,5 +1,5 @@
-// MCP stdio smoke test: speaks JSON-RPC to `kimi-worker-mcp serve` directly.
-// Usage: node scripts/mcp-smoke.mjs <repo_path>   (uses KIMI_WORKER_BACKEND=fake)
+// MCP stdio smoke test: speaks JSON-RPC to `workforce-mcp serve` directly.
+// Usage: node scripts/mcp-smoke.mjs <repo_path>   (uses WORKFORCE_BACKEND=fake)
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -16,9 +16,9 @@ const workerRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'kwm-smoke-root-'));
 const server = spawn(process.execPath, ['dist/cli.js', 'serve'], {
   env: {
     ...process.env,
-    KIMI_WORKER_BACKEND: 'fake',
-    KIMI_WORKER_ROOT: workerRoot,
-    KIMI_WORKER_TERMINATE_GRACE_MS: '200',
+    WORKFORCE_BACKEND: 'fake',
+    WORKFORCE_ROOT: workerRoot,
+    WORKFORCE_TERMINATE_GRACE_MS: '200',
   },
   stdio: ['pipe', 'pipe', 'inherit'],
 });

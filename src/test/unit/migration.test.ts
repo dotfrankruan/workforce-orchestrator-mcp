@@ -27,7 +27,7 @@ test('v1 database migrates automatically and old rows stay readable', () => {
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     )
     .run(
-      'wk_legacy01', '/tmp/oldrepo', 'a'.repeat(40), 'kimi-worker/wk_legacy01',
+      'wk_legacy01', '/tmp/oldrepo', 'a'.repeat(40), 'workforce/worker/wk_legacy01',
       '/tmp/oldrepo-wt', '/tmp/oldrepo-logs', 'completed', 'legacy task',
       '2026-01-01T00:00:00.000Z', '2026-01-01T00:01:00.000Z', 'deadbeef'.padEnd(40, '0'), 'done',
     );

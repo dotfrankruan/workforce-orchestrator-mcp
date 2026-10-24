@@ -1,7 +1,7 @@
-// Real Kimi workflow E2E: A (analysis.md) → B (modify hello.txt) → C (review.md)
+// Real worker workflow E2E: A (analysis.md) → B (modify hello.txt) → C (review.md)
 // in a temporary git repo. Verifies DAG scheduling, artifacts, supervisor
 // commits, wait_workflow, compact workflow result.
-// Usage: node scripts/workflow-e2e.mjs   (calls the live Kimi API)
+// Usage: node scripts/workflow-e2e.mjs   (calls the live provider API)
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -23,7 +23,7 @@ git(['commit', '-qm', 'init']);
 const mainHeadBefore = git(['rev-parse', 'HEAD']).trim();
 
 const server = spawn(process.execPath, ['dist/cli.js', 'serve'], {
-  env: { ...process.env, KIMI_WORKER_ROOT: workerRoot },
+  env: { ...process.env, WORKFORCE_ROOT: workerRoot },
   stdio: ['pipe', 'pipe', 'inherit'],
 });
 
@@ -53,7 +53,7 @@ let exitCode = 0;
 try {
   await request('initialize', { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'wf-e2e', version: '0.1' } });
 
-  console.log('→ creating 3-task workflow on a temp repo (live Kimi K3)…');
+  console.log('→ creating 3-task workflow on a temp repo (live DSH backend)…');
   const wf = await tool('create_workflow', {
     name: 'mini-e2e',
     workspace: { type: 'git_worktree', repo_path: repoPath },

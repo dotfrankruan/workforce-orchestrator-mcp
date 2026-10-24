@@ -20,5 +20,5 @@ test('isValidWorkerId rejects bad input', () => {
 });
 
 test('workerBranch', () => {
-  assert.equal(workerBranch('wk_ab12cd34'), 'kimi-worker/wk_ab12cd34');
+  assert.equal(workerBranch('wk_ab12cd34'), 'workforce/worker/wk_ab12cd34');
 });

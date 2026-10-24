@@ -3,9 +3,9 @@ import assert from 'node:assert/strict';
 import { redactSecrets } from '../../util/redact.js';
 
 test('redacts KEY=value style secrets', () => {
-  const out = redactSecrets('KIMI_CODING_API_KEY=sk-abcdef123456 more text');
+  const out = redactSecrets('WORKFORCE_CODING_API_KEY=sk-abcdef123456 more text');
   assert.ok(!out.includes('sk-abcdef123456'));
-  assert.ok(out.includes('KIMI_CODING_API_KEY=[REDACTED]'));
+  assert.ok(out.includes('WORKFORCE_CODING_API_KEY=[REDACTED]'));
 });
 
 test('redacts sk- style keys anywhere', () => {

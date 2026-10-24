@@ -67,11 +67,11 @@ test('task duration budget maps to execution timeout', async () => {
   }
 });
 
-test('workflow token budget: exceeding max_kimi_tokens fails the workflow', async () => {
+test('workflow token budget: exceeding max_worker_tokens fails the workflow', async () => {
   const h = makeHarness(() => bigUsage(600));
   try {
     const wf = h.supervisor.createWorkflow({
-      budget: { max_kimi_tokens: 1000 },
+      budget: { max_worker_tokens: 1000 },
       tasks: [
         { key: 'a', task: 'TAG_A', mode: 'general' },
         { key: 'b', task: 'TAG_B', mode: 'general', depends_on: ['a'] },
@@ -84,7 +84,7 @@ test('workflow token budget: exceeding max_kimi_tokens fails the workflow', asyn
     assert.equal(bRow.status, 'budget_exceeded');
     // b started, emitted usage pushing the workflow total over budget, and
     // was terminated mid-run (best-effort, per-event granularity).
-    // max_kimi_tokens still accepted as deprecated alias; canonical reason reported.
+    // max_worker_tokens still accepted as deprecated alias; canonical reason reported.
     assert.ok(JSON.parse(bRow.error!).budget.reason.includes('worker_tokens'));
   } finally {
     h.cleanup();

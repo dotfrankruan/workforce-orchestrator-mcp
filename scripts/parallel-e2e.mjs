@@ -1,8 +1,8 @@
-// Real Kimi E2E for v4.1: parallel git writers + fan-in integration.
+// Real worker E2E for v4.1: parallel git writers + fan-in integration.
 // A modifies a.txt, B modifies b.txt (truly parallel, isolated worktrees),
 // C depends on A+B and writes summary.txt. Verifies isolation, serialized
 // integration, snapshot correctness, supervisor commits, main untouched.
-// Usage: node scripts/parallel-e2e.mjs   (calls the live Kimi API)
+// Usage: node scripts/parallel-e2e.mjs   (calls the live provider API)
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -25,7 +25,7 @@ git(['commit', '-qm', 'init']);
 const mainHeadBefore = git(['rev-parse', 'HEAD']).trim();
 
 const server = spawn(process.execPath, ['dist/cli.js', 'serve'], {
-  env: { ...process.env, KIMI_WORKER_ROOT: workerRoot },
+  env: { ...process.env, WORKFORCE_ROOT: workerRoot },
   stdio: ['pipe', 'pipe', 'inherit'],
 });
 
@@ -55,7 +55,7 @@ let exitCode = 0;
 try {
   await request('initialize', { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'par-e2e', version: '0.1' } });
 
-  console.log('→ creating parallel workflow (live Kimi K3)…');
+  console.log('→ creating parallel workflow (live DSH backend)…');
   const wf = await tool('create_workflow', {
     name: 'parallel-e2e',
     workspace: { type: 'git_worktree', repo_path: repoPath },

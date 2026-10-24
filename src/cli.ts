@@ -10,10 +10,11 @@ import { serveStdio } from './mcp/server.js';
 
 function buildBackend(config: Config): WorkerBackend | BackendRegistry {
   if (config.backend === 'fake') {
-    // For local experimentation only (KIMI_WORKER_BACKEND=fake).
+    // For local experimentation only (WORKFORCE_BACKEND=fake).
     return new FakeBackend({ scenario: () => FakeScenarios.success() });
   }
-  // Zero-config default: DSH at /usr/local/bin/dsh (or PATH), headless profile.
+  // Builds dsh + opencode + openai + anthropic; the registry routes to the
+  // configured default (or the first locally available backend for "auto").
   return createDefaultRegistry(config);
 }
 
@@ -107,47 +108,52 @@ function renderWorkflowAscii(overview: Record<string, unknown>): string {
 
 function usage(): never {
   process.stderr.write(
-    `kimi-worker-mcp — delegate engineering tasks to Kimi workers via DeepSeek Harness
+    `workforce-mcp — delegate engineering tasks to pluggable worker backends
 
 Usage:
-  kimi-worker-mcp serve                 Start the MCP server on stdio
-  kimi-worker-mcp workers [--status S] [--repo PATH] [--limit N]
-                                        List workers
-  kimi-worker-mcp tasks [--status S] [--limit N]
-                                        List tasks (alias of workers)
-  kimi-worker-mcp task <id>             Show compact task result (with artifacts)
-  kimi-worker-mcp inspect <worker-id>   Show compact worker result (git-focused)
-  kimi-worker-mcp artifacts <id>        List task artifacts
-  kimi-worker-mcp artifact <id> <path> [--max-bytes N]
-                                        Print artifact content (capped)
-  kimi-worker-mcp usage <id>            Show task token/tool usage
-  kimi-worker-mcp logs <worker-id> [--lines N]
-                                        Show worker log tail
-  kimi-worker-mcp diff <worker-id> [--full]
-                                        Show worker diff stat (or full diff)
-  kimi-worker-mcp cancel <worker-id>    Cancel a running worker
-  kimi-worker-mcp workflows             List workflows
-  kimi-worker-mcp workflow <wf-id>      Show workflow DAG (ASCII)
-  kimi-worker-mcp workflow-wait <wf-id> [--timeout S]
-  kimi-worker-mcp workflow-cancel <wf-id>
-  kimi-worker-mcp review-task <id> <accepted|rejected|needs_revision> [--feedback "..."]
-  kimi-worker-mcp task-metrics <id>     Per-task metrics
-  kimi-worker-mcp workflow-metrics <wf-id>
-  kimi-worker-mcp metrics               System-wide metrics
-  kimi-worker-mcp roles                 List role templates
-  kimi-worker-mcp presets               List workflow presets
-  kimi-worker-mcp cache-stats           Artifact cache stats
-  kimi-worker-mcp backends              List runtime backends
-  kimi-worker-mcp backend <id>          Show backend details
+  workforce-mcp serve                 Start the MCP server on stdio
+  workforce-mcp workers [--status S] [--repo PATH] [--limit N]
+                                      List workers
+  workforce-mcp tasks [--status S] [--limit N]
+                                      List tasks (alias of workers)
+  workforce-mcp task <id>             Show compact task result (with artifacts)
+  workforce-mcp inspect <worker-id>   Show compact worker result (git-focused)
+  workforce-mcp artifacts <id>        List task artifacts
+  workforce-mcp artifact <id> <path> [--max-bytes N]
+                                      Print artifact content (capped)
+  workforce-mcp usage <id>            Show task token/tool usage
+  workforce-mcp logs <worker-id> [--lines N]
+                                      Show worker log tail
+  workforce-mcp diff <worker-id> [--full]
+                                      Show worker diff stat (or full diff)
+  workforce-mcp cancel <worker-id>    Cancel a running worker
+  workforce-mcp workflows             List workflows
+  workforce-mcp workflow <wf-id>      Show workflow DAG (ASCII)
+  workforce-mcp workflow-wait <wf-id> [--timeout S]
+  workforce-mcp workflow-cancel <wf-id>
+  workforce-mcp review-task <id> <accepted|rejected|needs_revision> [--feedback "..."]
+  workforce-mcp task-metrics <id>     Per-task metrics
+  workforce-mcp workflow-metrics <wf-id>
+  workforce-mcp metrics               System-wide metrics
+  workforce-mcp roles                 List role templates
+  workforce-mcp presets               List workflow presets
+  workforce-mcp cache-stats           Artifact cache stats
+  workforce-mcp backends              List runtime backends
+  workforce-mcp backend <id>          Show backend details
 
 Configuration (environment variables):
-  KIMI_WORKER_DSH_BIN         dsh binary path (default /usr/local/bin/dsh)
-  KIMI_WORKER_DSH_PROFILE     dsh profile (default headless)
-  KIMI_WORKER_ROOT            worker state root (default ~/.kimi-workers)
-  KIMI_WORKER_DB              SQLite db path (default <root>/workers.db)
-  KIMI_WORKER_MAX_CONCURRENT  max parallel workers (default 4)
-  KIMI_WORKER_DEFAULT_TIMEOUT default per-worker timeout seconds (default 3600)
-  KIMI_WORKER_BACKEND         "dsh" (default) or "fake" for local testing
+  WORKFORCE_BACKEND               auto (default), dsh, opencode, openai, anthropic, fake
+  WORKFORCE_ROOT                  worker state root (default ~/.workforce/workers)
+  WORKFORCE_DB                    SQLite db path (default <root>/workers.db)
+  WORKFORCE_MAX_CONCURRENT        max parallel workers (default 4)
+  WORKFORCE_DEFAULT_TIMEOUT       default per-worker timeout seconds (default 3600)
+  WORKFORCE_DSH_COMMAND           dsh binary path (default /usr/local/bin/dsh or PATH)
+  WORKFORCE_DSH_PROFILE           dsh profile (default headless)
+  WORKFORCE_OPENCODE_COMMAND      opencode binary (default opencode on PATH)
+  WORKFORCE_OPENCODE_MODEL        opencode model (provider/model)
+  WORKFORCE_OPENAI_API_KEY        OpenAI API key (or OPENAI_API_KEY)
+  WORKFORCE_ANTHROPIC_API_KEY     Anthropic API key (or ANTHROPIC_API_KEY)
+See README.md and ~/.workforce/config.json for all options.
 `,
   );
   process.exit(2);
@@ -168,7 +174,7 @@ async function main(): Promise<void> {
       supervisor.init();
 
       const shutdown = async () => {
-        process.stderr.write('kimi-worker-mcp: shutting down, terminating workers…\n');
+        process.stderr.write('workforce-mcp: shutting down, detaching workers…\n');
         await supervisor.shutdown();
         process.exit(0);
       };
@@ -424,6 +430,6 @@ async function main(): Promise<void> {
 }
 
 main().catch((err) => {
-  process.stderr.write(`kimi-worker-mcp: fatal: ${err instanceof Error ? err.message : String(err)}\n`);
+  process.stderr.write(`workforce-mcp: fatal: ${err instanceof Error ? err.message : String(err)}\n`);
   process.exit(1);
 });

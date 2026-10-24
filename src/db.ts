@@ -104,7 +104,7 @@ export interface WorkerRow {
   max_attempts: number;
   retry_on: string; // JSON array of statuses
   // v4: parallel git isolation & integration
-  task_branch: string | null; // kimi-task/<id> branch for git-workflow tasks
+  task_branch: string | null; // workforce/task/<id> branch for git-workflow tasks
   workspace_base_commit: string | null; // immutable snapshot commit the task started from
   task_commits: string; // JSON array of commit shas created by this task (all runs)
   integration_status: string | null; // null | pending | integrating | integrated | conflict | skipped
@@ -267,10 +267,8 @@ export interface TaskBudget {
 
 export interface WorkflowBudget {
   max_duration_seconds?: number;
-  /** Canonical: max total worker tokens (input+output+cache) across the workflow. */
+  /** Max total worker tokens (input+output+cache) across the workflow. */
   max_worker_tokens?: number;
-  /** Deprecated alias of max_worker_tokens (kept readable for old clients). */
-  max_kimi_tokens?: number;
   max_concurrent_tasks?: number;
   max_tasks?: number;
 }

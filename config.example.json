@@ -1,22 +1,42 @@
 {
-  "default_backend": "dsh",
+  "default_backend": "auto",
   "backends": {
     "dsh": {
       "command": "/usr/local/bin/dsh",
       "profile": "headless"
+    },
+    "opencode": {
+      "command": "opencode",
+      "auto_approve": true,
+      "model": "anthropic/claude-sonnet-4-5"
+    },
+    "openai": {
+      "api_key_env": "OPENAI_API_KEY",
+      "base_url": "https://api.openai.com/v1",
+      "model": "gpt-4.1",
+      "api": "chat_completions",
+      "max_output_tokens": 8192,
+      "max_iterations": 48
+    },
+    "anthropic": {
+      "api_key_env": "ANTHROPIC_API_KEY",
+      "base_url": "https://api.anthropic.com",
+      "model": "claude-sonnet-4-5",
+      "max_output_tokens": 8192,
+      "max_iterations": 48
     }
   },
   "routing": {
-    "default": "dsh",
+    "default": "auto",
     "roles": {
-      "implementer": "dsh",
-      "tester": "dsh",
-      "researcher": "dsh",
-      "reviewer": "dsh",
-      "docs_writer": "dsh",
-      "data_analyst": "dsh",
-      "debugger": "dsh",
-      "ops_analyst": "dsh"
+      "implementer": "auto",
+      "tester": "auto",
+      "researcher": "auto",
+      "reviewer": "auto",
+      "docs_writer": "auto",
+      "data_analyst": "auto",
+      "debugger": "auto",
+      "ops_analyst": "auto"
     }
   }
 }

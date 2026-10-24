@@ -1,11 +1,11 @@
 // Real DSH reattach E2E (v4.1.1 durability hotfix validation):
-//   1. spawn a real Kimi task that takes ~20-30s
+//   1. spawn a real worker task that takes ~20-30s
 //   2. kill the MCP supervisor process (NOT the dsh worker)
 //   3. verify the dsh process is still alive
 //   4. restart the MCP server → reconciliation reattaches
 //   5. task completes → supervisor git-finalizes → commit verified
 //   6. main repo untouched
-// Usage: node scripts/reattach-e2e.mjs   (live Kimi API)
+// Usage: node scripts/reattach-e2e.mjs   (live provider API)
 import { spawn, execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -25,7 +25,7 @@ git(['add', '-A']);
 git(['commit', '-qm', 'init']);
 const mainHead = git(['rev-parse', 'HEAD']).trim();
 
-const env = { ...process.env, KIMI_WORKER_ROOT: workerRoot };
+const env = { ...process.env, WORKFORCE_ROOT: workerRoot };
 
 function startServer() {
   const srv = spawn(process.execPath, ['dist/cli.js', 'serve'], { env, stdio: ['pipe', 'pipe', 'pipe'] });
@@ -65,7 +65,7 @@ try {
   serverA = startServer();
   await serverA.request('initialize', { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'reattach-e2e', version: '1' } });
 
-  console.log('→ spawning real Kimi task (~20-30s: edit + sleep)…');
+  console.log('→ spawning real worker task (~20-30s: edit + sleep)…');
   const spawnRes = await serverA.tool('spawn_task', {
     mode: 'code',
     workspace: { type: 'git_worktree', repo_path: repoPath },

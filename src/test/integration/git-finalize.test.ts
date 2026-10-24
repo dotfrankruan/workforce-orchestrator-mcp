@@ -5,7 +5,7 @@ import path from 'node:path';
 import { FakeScenarios, type FakeScenario } from '../../backends/fake.js';
 import { makeTempRepo, makeHarness, git, removeDir } from '../helpers.js';
 
-const COMMIT_ENV_ARGS = ['-c', 'user.name=kimi-worker', '-c', 'user.email=kimi-worker@localhost', '-c', 'commit.gpgsign=false'];
+const COMMIT_ENV_ARGS = ['-c', 'user.name=workforce-worker', '-c', 'user.email=workforce-worker@localhost', '-c', 'commit.gpgsign=false'];
 
 /** Fake worker that modifies files and exits 0 WITHOUT committing. */
 function editOnlyScenario(edits: Array<{ path: string; content: string }>, finalText?: string): FakeScenario {
@@ -276,7 +276,7 @@ test('identity fallback: repo without user.name/email commits via -c, global con
     assert.equal(row.status, 'completed');
     assert.ok(row.commit_hash);
     const author = git(['log', '-1', '--format=%an <%ae>'], spawn.worktree).trim();
-    assert.equal(author, 'Kimi Workforce <kimi-workforce@localhost>');
+    assert.equal(author, 'Workforce Orchestrator <workforce@localhost>');
   } finally {
     h.cleanup();
     removeDir(dir);

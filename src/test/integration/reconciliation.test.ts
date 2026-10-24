@@ -16,7 +16,7 @@ test('reconciliation: dead pid + committed work → completed', async () => {
 
   // Simulate a worker that finished (with a commit) while the server was down.
   const workerId = 'wk_dead0001';
-  const branch = `kimi-worker/${workerId}`;
+  const branch = `workforce/worker/${workerId}`;
   const workerDir = path.join(root, 'sim-repo', workerId);
   const worktreePath = path.join(workerDir, 'worktree');
   fs.mkdirSync(workerDir, { recursive: true });
@@ -83,7 +83,7 @@ test('reconciliation: dead pid with no commit and no final → interrupted', asy
       id: workerId,
       repo_path: repo,
       base_ref: git(['rev-parse', 'HEAD'], repo).trim(),
-      branch: `kimi-worker/${workerId}`,
+      branch: `workforce/worker/${workerId}`,
       worktree_path: path.join(workerDir, 'worktree'),
       log_dir: workerDir,
       task: 'simulated',
@@ -120,7 +120,7 @@ test('reconciliation: live pid with mismatched identity → NOT attached (PID-re
       id: workerId,
       repo_path: repo,
       base_ref: git(['rev-parse', 'HEAD'], repo).trim(),
-      branch: `kimi-worker/${workerId}`,
+      branch: `workforce/worker/${workerId}`,
       worktree_path: path.join(workerDir, 'worktree'),
       log_dir: workerDir,
       task: 'simulated',
@@ -159,14 +159,14 @@ test('reconciliation: queued workers survive restart and get scheduled', async (
   const workerDir = path.join(root, 'sim', workerId);
   const worktreePath = path.join(workerDir, 'worktree');
   fs.mkdirSync(workerDir, { recursive: true });
-  git(['worktree', 'add', '-b', `kimi-worker/${workerId}`, worktreePath, base], repo);
+  git(['worktree', 'add', '-b', `workforce/worker/${workerId}`, worktreePath, base], repo);
 
   const store = new WorkerStore(config.dbPath);
   store.createWorker({
     id: workerId,
     repo_path: repo,
     base_ref: base,
-    branch: `kimi-worker/${workerId}`,
+    branch: `workforce/worker/${workerId}`,
     worktree_path: worktreePath,
     log_dir: workerDir,
     task: 'still queued',

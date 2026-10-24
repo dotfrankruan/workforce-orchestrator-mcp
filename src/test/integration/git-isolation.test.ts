@@ -47,8 +47,8 @@ test('parallel git writers: isolated worktrees, branches, integration contains b
     // Physical isolation invariant.
     assert.notEqual(b.worktree_path, c.worktree_path);
     assert.notEqual(b.task_branch, c.task_branch);
-    assert.match(b.task_branch!, /^kimi-task\//);
-    assert.match(c.task_branch!, /^kimi-task\//);
+    assert.match(b.task_branch!, /^workforce\/task\//);
+    assert.match(c.task_branch!, /^workforce\/task\//);
 
     // Same starting point: A's integrated commit.
     assert.equal(b.workspace_base_commit, c.workspace_base_commit);
@@ -259,7 +259,7 @@ test('continue after sibling integration: continuation starts from integrated HE
     assert.ok(files.includes('b.txt'));
     // New worktree path & branch (old preserved for audit).
     assert.ok(row.worktree_path.includes('worktree-r1'));
-    assert.match(row.task_branch!, /^kimi-task\/.+-r1$/);
+    assert.match(row.task_branch!, /^workforce\/task\/.+-r1$/);
     assert.equal(row.integration_status, 'integrated');
 
     const wfRow = h.store.getWorkflow(wf.workflow_id)!;
