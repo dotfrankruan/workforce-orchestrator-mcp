@@ -2,7 +2,7 @@
   "name": "kimi-workforce-mcp",
   "version": "0.2.0",
   "description": "MCP server that lets Codex delegate coding/research/data/docs/file/ops/review tasks to DeepSeek Harness (Kimi) workers",
-  "license": "MIT",
+  "license": "Apache-2.0",
   "type": "module",
   "bin": {
     "kimi-worker-mcp": "./dist/cli.js",
@@ -31,5 +31,10 @@
   "devDependencies": {
     "@types/node": "^24.0.0",
     "typescript": "^5.8.3"
-  }
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/dotfrankruan/workforce-orchestrator-mcp.git"
+  },
+  "homepage": "https://github.com/dotfrankruan/workforce-orchestrator-mcp"
 }
