@@ -40,19 +40,13 @@ configuration and credentials (`~/.dsh/.env`) — the orchestrator never reads
 them. Your Codex MCP config (`[mcp_servers.kimi]`, the name is yours) keeps
 working unchanged. Old databases migrate automatically (schema v1→v6).
 
-Optional configuration, only if you ever want it:
+Optional configuration exists (see
+[Backend configuration](#backend-configuration-workforceconfigjson)) but is
+**never required**. A missing config file = the exact defaults above.
 
-```jsonc
-// ~/.workforce/config.json  (optional — never required)
-{
-  "default_backend": "dsh",
-  "backends": { "dsh": { "command": "/usr/local/bin/dsh", "profile": "headless" } },
-  "routing": { "roles": { "reviewer": "dsh" } }
-}
-```
-
-Env overrides: `WORKFORCE_DEFAULT_BACKEND`, `WORKFORCE_DSH_COMMAND`,
-`WORKFORCE_DSH_PROFILE` (legacy `KIMI_WORKER_*` env vars keep working).
+Env overrides (all optional): `WORKFORCE_DEFAULT_BACKEND`,
+`WORKFORCE_DSH_COMMAND`, `WORKFORCE_DSH_PROFILE` (legacy `KIMI_WORKER_*`
+env vars keep working).
 
 ## What's new in v5
 
@@ -300,6 +294,165 @@ attempts are exhausted, the task result carries `attempts`,
 tell Codex to **return control to the human** (report the failure, note the
 preserved work, ask: retry later / do it Codex-side / abandon), never
 silently substituting expensive Codex-side execution.
+
+
+## Backend configuration (`~/.workforce/config.json`)
+
+The orchestrator works with **zero configuration** — but if you want to pin
+the DSH binary, change the profile, or (in the future) route certain roles to
+a different runtime backend, this optional file is the single place to do it.
+
+### Where it lives
+
+```
+~/.workforce/config.json        # fixed path; created by you, never by the server
+```
+
+- **Absent** → built-in defaults (DSH at `/usr/local/bin/dsh`, `headless`
+  profile, backend `dsh`). This is the zero-config path.
+- **Present** → parsed as **strict JSON** (no comments, no YAML). The server
+  reads it once at startup for `serve` / CLI commands.
+- Copy the template to get started:
+
+  ```bash
+  mkdir -p ~/.workforce
+  cp config.example.json ~/.workforce/config.json
+  # edit, then verify:
+  node dist/cli.js backends
+  ```
+
+### Schema
+
+All fields are optional. Unknown extra keys are ignored (forward compatible).
+
+| Field | Type | Default | Effect |
+|---|---|---|---|
+| `default_backend` | `string` | `"dsh"` | Backend used when a task doesn't name one and no role rule matches. |
+| `backends.dsh.command` | `string` | `/usr/local/bin/dsh` | DSH executable. Use an absolute path (e.g. Homebrew's `/opt/homebrew/bin/dsh`). |
+| `backends.dsh.profile` | `string` | `headless` | DSH profile passed as `--profile <name>`. The profile itself (provider/model/credentials) stays inside DSH. |
+| `routing.default` | `string` | — | Overrides `default_backend` (takes precedence over it). |
+| `routing.roles.<role>` | `string` | — | Per-role backend override (`implementer`, `tester`, `researcher`, `reviewer`, `docs_writer`, `data_analyst`, `debugger`, `ops_analyst`). |
+
+> Today only the `dsh` backend ships. `default_backend` / role routes are
+> already functional and are what future adapters (Claude Code, OpenCode,
+> Aider) will plug into — you can point them at `dsh` now and change the
+> target later without touching task definitions.
+>
+> Any backend id referenced here must be registered, otherwise startup fails
+> with a clear error (we never silently fall back to another provider).
+
+### Examples
+
+**1. Pin the executable and profile (most common)**
+
+```json
+{
+  "backends": {
+    "dsh": { "command": "/opt/homebrew/bin/dsh", "profile": "headless" }
+  }
+}
+```
+
+**2. Minimal valid file — identical to no config file**
+
+```json
+{}
+```
+
+**3. Explicit default backend**
+
+```json
+{
+  "default_backend": "dsh"
+}
+```
+
+**4. Role routing** (e.g. send reviews to a different runtime once an adapter
+exists; all values must be registered backend ids)
+
+```json
+{
+  "routing": {
+    "default": "dsh",
+    "roles": {
+      "reviewer": "dsh",
+      "researcher": "dsh"
+    }
+  }
+}
+```
+
+**5. Full reference** — see [`config.example.json`](config.example.json),
+which mirrors the schema above with every field populated.
+
+### Resolution order (first hit wins)
+
+**Backend choice for a task:**
+
+1. explicit `backend` on the task / workflow task (`spawn_task({ backend })`)
+2. `routing.roles.<role>` match
+3. `routing.default`
+4. `default_backend`
+5. `WORKFORCE_DEFAULT_BACKEND` env var
+6. built-in default: `dsh`
+
+**DSH executable:**
+
+1. `backends.dsh.command` from this file
+2. `WORKFORCE_DSH_COMMAND` env var
+3. legacy `KIMI_WORKER_DSH_BIN` env var
+4. `/usr/local/bin/dsh` if executable
+5. `dsh` found on `PATH`
+6. none → spawn fails with:
+   `Default backend "dsh" is unavailable: could not find /usr/local/bin/dsh or dsh in PATH. Install DeepSeek Harness or set WORKFORCE_DSH_COMMAND.`
+   (nothing is ever auto-installed)
+
+**DSH profile:**
+
+1. `backends.dsh.profile`
+2. `WORKFORCE_DSH_PROFILE` env var
+3. legacy `KIMI_WORKER_DSH_PROFILE` env var
+4. `headless`
+
+### Environment overrides
+
+| Variable | Meaning | Legacy alias |
+|---|---|---|
+| `WORKFORCE_DEFAULT_BACKEND` | default backend id | — |
+| `WORKFORCE_DSH_COMMAND` | DSH executable path | `KIMI_WORKER_DSH_BIN` |
+| `WORKFORCE_DSH_PROFILE` | DSH profile | `KIMI_WORKER_DSH_PROFILE` |
+
+Env vars are handy for one-off runs and CI; the config file is better for
+long-lived Codex setups.
+
+### Validation and failure behavior
+
+| Situation | Behavior |
+|---|---|
+| File absent | built-in defaults (zero-config) |
+| Invalid JSON / non-object | startup error: `invalid workforce config at ~/.workforce/config.json: …` |
+| `default_backend` / route points at an unregistered backend | startup error: `default backend "x" is not registered (available: dsh)` or `routing role "reviewer" points at unknown backend "x"` |
+| Chosen backend executable missing | clear spawn-time error (see order above); no automatic fallback |
+| Backend unavailable but another one registered | **still an error** — fallback is never implicit; pick a different backend explicitly or fix the runtime |
+
+### What this file must NOT contain
+
+- **No API keys or credentials.** The runtime (DSH) owns provider
+  configuration and `~/.dsh/.env`; the orchestrator never reads those files
+  and never forwards secrets. Pointing `backends.dsh.command` at the dsh
+  binary is all that's needed.
+- No provider/model selection — that lives in the DSH profile itself.
+
+### Verify your configuration
+
+```bash
+node dist/cli.js backends          # list backends: default + local availability
+node dist/cli.js backend dsh       # details of one backend
+```
+
+`available: false` means the executable could not be found — check
+`backends.dsh.command` / `PATH`; the orchestrator intentionally probes only
+local availability and never spends provider quota to test a model.
 
 ## Requirements
 
@@ -603,7 +756,11 @@ queued ──► starting ──► running ──► completed
   `workspace_type=git_worktree`, `workflow_id=null`. No manual migration, no
   data loss.
 
-## Configuration
+## Runtime configuration (environment)
+
+Backend selection and the optional `~/.workforce/config.json` are documented
+in [Backend configuration](#backend-configuration-workforceconfigjson). The
+table below covers worker/runtime knobs:
 
 | Variable | Default | Meaning |
 |---|---|---|
@@ -625,11 +782,15 @@ queued ──► starting ──► running ──► completed
 Model selection (e.g. a newer Kimi model) is done in your dsh profile — this
 server invokes the profile and never hardcodes a model.
 
+Canonical backend env aliases: `WORKFORCE_DEFAULT_BACKEND`,
+`WORKFORCE_DSH_COMMAND` (overrides `KIMI_WORKER_DSH_BIN`),
+`WORKFORCE_DSH_PROFILE` (overrides `KIMI_WORKER_DSH_PROFILE`).
+
 ## Development
 
 ```bash
 npm run build
-npm test                 # 80+ tests: unit + integration (fake backend, temp repos)
+npm test                 # 188 tests: unit + integration (fake backends, temp repos)
 npm run test:unit
 npm run test:integration
 ```

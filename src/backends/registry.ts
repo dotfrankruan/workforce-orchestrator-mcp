@@ -31,11 +31,14 @@ export interface WorkforceFileConfig {
   };
 }
 
-const CONFIG_PATH = path.join(os.homedir(), '.workforce', 'config.json');
+/** Fixed, documented config location: ~/.workforce/config.json */
+export function defaultConfigPath(): string {
+  return path.join(os.homedir(), '.workforce', 'config.json');
+}
 
 /** Optional user config. Absent file = built-in defaults. Never required. */
 export function loadFileConfig(configPath?: string): WorkforceFileConfig | null {
-  const p = configPath ?? CONFIG_PATH;
+  const p = configPath ?? defaultConfigPath();
   try {
     const raw = fs.readFileSync(p, 'utf8');
     const parsed = JSON.parse(raw) as unknown;

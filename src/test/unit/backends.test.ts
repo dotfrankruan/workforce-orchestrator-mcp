@@ -188,3 +188,29 @@ test('env override WORKFORCE_DEFAULT_BACKEND changes the default', () => {
   assert.equal(registry.defaultBackendId, 'fake-b');
   assert.equal(registry.resolve({}).id, 'fake-b');
 });
+
+test('config file is read from ~/.workforce/config.json (documented path)', () => {
+  const tmpHome = makeTempDir('kwm-home-');
+  const prevHome = process.env.HOME;
+  try {
+    fs.mkdirSync(path.join(tmpHome, '.workforce'), { recursive: true });
+    fs.writeFileSync(
+      path.join(tmpHome, '.workforce', 'config.json'),
+      JSON.stringify({ backends: { dsh: { command: '/opt/homebrew/bin/dsh', profile: 'headless' } } }),
+    );
+    process.env.HOME = tmpHome;
+
+    // Lazy path resolution follows HOME (documentation-verified behavior).
+    const cfg = loadFileConfig();
+    assert.equal(cfg?.backends?.dsh?.command, '/opt/homebrew/bin/dsh');
+
+    const config = baseConfig(tmpHome);
+    const exe = resolveDshExecutable(config, cfg);
+    assert.equal(exe.command, '/opt/homebrew/bin/dsh');
+    assert.equal(exe.source, 'config');
+  } finally {
+    if (prevHome === undefined) delete process.env.HOME;
+    else process.env.HOME = prevHome;
+    removeDir(tmpHome);
+  }
+});

@@ -1,0 +1,22 @@
+{
+  "default_backend": "dsh",
+  "backends": {
+    "dsh": {
+      "command": "/usr/local/bin/dsh",
+      "profile": "headless"
+    }
+  },
+  "routing": {
+    "default": "dsh",
+    "roles": {
+      "implementer": "dsh",
+      "tester": "dsh",
+      "researcher": "dsh",
+      "reviewer": "dsh",
+      "docs_writer": "dsh",
+      "data_analyst": "dsh",
+      "debugger": "dsh",
+      "ops_analyst": "dsh"
+    }
+  }
+}
