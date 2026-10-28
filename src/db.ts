@@ -118,6 +118,8 @@ export interface WorkerRow {
   // v6: universal backend
   backend_id: string; // runtime backend that executes the task (default dsh)
   backend_metadata: string | null; // JSON {runtime:{...}, provider:{...}} — facts only
+  // v7: per-task model override (NULL = backend/profile default)
+  model: string | null;
 }
 
 export interface WorkflowRow {
@@ -209,6 +211,8 @@ export interface WorkerPatch {
   stdout_parse_offset?: number;
   pid_identity?: string | null;
   backend_metadata?: string | null;
+  /** Per-task model override (backend must support modelSelection). */
+  model?: string | null;
 }
 
 export interface NewWorker {
@@ -239,6 +243,8 @@ export interface NewWorker {
   initialStatus?: WorkerStatus;
   backend_id?: string;
   backend_metadata?: string | null;
+  /** Per-task model override (backend must support modelSelection). */
+  model?: string | null;
 }
 
 export interface NewWorkflow {
@@ -467,7 +473,13 @@ const WORKERS_V6_COLUMNS: Array<[string, string]> = [
   ['backend_metadata', `ALTER TABLE workers ADD COLUMN backend_metadata TEXT`],
 ];
 
-const CURRENT_SCHEMA_VERSION = 6;
+/** Columns added in schema v7 (per-task model selection). */
+const WORKERS_V7_COLUMNS: Array<[string, string]> = [
+  // Explicit per-task model override; NULL = backend/profile default.
+  ['model', `ALTER TABLE workers ADD COLUMN model TEXT`],
+];
+
+const CURRENT_SCHEMA_VERSION = 7;
 
 const ALL_COLUMNS = [
   'id', 'repo_path', 'base_ref', 'branch', 'worktree_path', 'log_dir', 'status', 'task',
@@ -481,7 +493,7 @@ const ALL_COLUMNS = [
   'task_branch', 'workspace_base_commit', 'task_commits', 'integration_status',
   'integration_error', 'integrated_commits',
   'run_started_at', 'supervision_state', 'stdout_parse_offset', 'pid_identity',
-  'backend_id', 'backend_metadata',
+  'backend_id', 'backend_metadata', 'model',
 ] as const;
 
 function rowToWorker(row: Record<string, unknown>): WorkerRow {
@@ -574,6 +586,13 @@ function migrate(db: DatabaseSync): void {
     version = 6;
   }
 
+  if (version < 7) {
+    for (const [col, ddl] of WORKERS_V7_COLUMNS) {
+      if (!columnExists(db, 'workers', col)) db.exec(ddl);
+    }
+    version = 7;
+  }
+
   db.exec(`CREATE TABLE IF NOT EXISTS schema_meta (id INTEGER PRIMARY KEY CHECK (id = 1), version INTEGER NOT NULL)`);
   db.prepare(
     `INSERT INTO schema_meta (id, version) VALUES (1, ?)
@@ -611,8 +630,8 @@ export class WorkerStore {
       .prepare(
         `INSERT INTO workers (id, repo_path, base_ref, branch, worktree_path, log_dir, status, task, mode, workspace_type, deliverables, capabilities, created_at, updated_at, timeout_seconds,
            workflow_id, task_key, depends_on, dependency_policy, role, priority, cache_policy, execution_class, budget, max_attempts, retry_on,
-           backend_id, backend_metadata)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           backend_id, backend_metadata, model)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         w.id, w.repo_path, w.base_ref, w.branch, w.worktree_path, w.log_dir,
@@ -622,7 +641,7 @@ export class WorkerStore {
         w.dependency_policy ?? 'all_success', w.role ?? null, w.priority ?? 'normal',
         w.cache_policy ?? 'off', w.execution_class ?? null, w.budget ?? null,
         w.max_attempts ?? 1, w.retry_on ?? '["failed","timeout"]',
-        w.backend_id ?? 'dsh', w.backend_metadata ?? null,
+        w.backend_id ?? 'dsh', w.backend_metadata ?? null, w.model ?? null,
       );
     return this.getWorker(w.id)!;
   }
@@ -911,6 +930,33 @@ export class WorkerStore {
       | { value: string }
       | undefined;
     return row ? Number(row.value) : 0;
+  }
+
+  /** Token totals + task counts grouped by backend and per-task model. */
+  modelAgg(): Array<{
+    backend_id: string;
+    model: string | null;
+    tasks: number;
+    input: number;
+    output: number;
+    cache_read: number;
+  }> {
+    return this.db
+      .prepare(
+        `SELECT backend_id, model, COUNT(*) AS tasks,
+           COALESCE(SUM(input_tokens),0) AS input,
+           COALESCE(SUM(output_tokens),0) AS output,
+           COALESCE(SUM(cache_read_tokens),0) AS cache_read
+         FROM workers GROUP BY backend_id, model`,
+      )
+      .all() as unknown as Array<{
+      backend_id: string;
+      model: string | null;
+      tasks: number;
+      input: number;
+      output: number;
+      cache_read: number;
+    }>;
   }
 
   /** Token totals + task counts grouped by backend. */

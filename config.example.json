@@ -3,7 +3,10 @@
   "backends": {
     "dsh": {
       "command": "/usr/local/bin/dsh",
-      "profile": "headless"
+      "profile": "headless",
+      "model": "k3",
+      "provider": "kimi-coding",
+      "reasoning_effort": "max"
     },
     "opencode": {
       "command": "opencode",

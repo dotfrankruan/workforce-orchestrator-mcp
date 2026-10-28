@@ -16,6 +16,8 @@ import type { TaskMode } from '../modes.js';
 
 export interface BackendStartOptions {
   workerId: string;
+  /** Per-run model override (backend-specific). Undefined = backend default. */
+  model?: string | undefined;
   /** Working directory = the task's workspace. */
   cwd: string;
   /** Full prompt passed to the worker runtime. */
@@ -44,7 +46,26 @@ export interface WorkerBackendHandle {
   terminate(graceMs: number): Promise<void>;
 }
 
+/** One model a runtime is configured to serve (facts read from runtime config). */
+export interface BackendModelEntry {
+  provider: string;
+  id: string;
+  name?: string | undefined;
+}
+
+/** Runtime-discovered model/provider facts. Never guessed. */
+export interface BackendRuntimeInfo {
+  models: BackendModelEntry[];
+  default?: {
+    provider?: string | undefined;
+    model?: string | undefined;
+    reasoningEffort?: string | undefined;
+  } | undefined;
+}
+
 export interface BackendCapabilities {
+  /** Accepts a per-run model override (spawn_task { model }). */
+  modelSelection: boolean;
   /** Session continuation (continue_worker). */
   continuation: boolean;
   /** Can be reattached after a supervisor restart (pid + durable logs). */
@@ -82,6 +103,11 @@ export interface WorkerBackend {
   isAvailable(): boolean;
   /** Optional runtime/provider facts known without contacting the provider. */
   metadata?(): BackendMetadata;
+  /**
+   * Discover the runtime's configured models/default selection WITHOUT any
+   * network call (e.g. dsh --dump-config). null/undefined = unknown.
+   */
+  inspectRuntime?(): BackendRuntimeInfo | null;
   /**
    * Parse one durable stdout line into the normalized raw event shape.
    * Defaults to the DSH JSONL parser. Backends whose wire format differs

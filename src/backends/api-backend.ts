@@ -168,6 +168,7 @@ export abstract class ApiAgentBackend implements WorkerBackend {
   abstract readonly displayName: string;
   abstract readonly providerName: string;
   readonly capabilities = {
+    modelSelection: true,
     continuation: true,
     durableReattach: false,
     structuredEvents: true,
@@ -197,7 +198,7 @@ export abstract class ApiAgentBackend implements WorkerBackend {
   /** Provider-specific conversation state setup. */
   protected abstract begin(prompt: string, sessionId: string | null): void;
   /** Perform one API request (must append the assistant turn to state). */
-  protected abstract requestTurn(signal: AbortSignal): Promise<ProviderTurn>;
+  protected abstract requestTurn(signal: AbortSignal, model: string): Promise<ProviderTurn>;
   /** Append tool results so the next request sees them. */
   protected abstract addToolResults(calls: ProviderToolCall[], outputs: string[]): void;
 
@@ -228,7 +229,7 @@ export abstract class ApiAgentBackend implements WorkerBackend {
         sink.status('turn_start', turn);
         let t: ProviderTurn;
         try {
-          t = await this.requestTurn(controller.signal);
+          t = await this.requestTurn(controller.signal, opts.model ?? this.opts.model);
         } catch (err) {
           if (controller.signal.aborted) return;
           const message = (err as Error).message;

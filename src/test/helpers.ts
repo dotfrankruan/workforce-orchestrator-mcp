@@ -146,6 +146,7 @@ export class ProcScriptBackend implements WorkerBackend {
   readonly id = 'procscript';
   readonly displayName = 'ProcScriptBackend';
   readonly capabilities = {
+    modelSelection: true,
     continuation: true,
     durableReattach: true,
     structuredEvents: true,

@@ -148,6 +148,7 @@ export class OpenCodeBackend implements WorkerBackend {
   readonly id = 'opencode';
   readonly displayName = 'OpenCode';
   readonly capabilities = {
+    modelSelection: true,
     continuation: true,
     durableReattach: true,
     structuredEvents: true,
@@ -209,7 +210,8 @@ export class OpenCodeBackend implements WorkerBackend {
 
     const args = ['run', '--format', 'json'];
     if (this.opts.autoApprove !== false) args.push('--auto');
-    if (this.opts.model) args.push('--model', this.opts.model);
+    const model = opts.model ?? this.opts.model;
+    if (model) args.push('--model', model);
     if (this.opts.agent) args.push('--agent', this.opts.agent);
     if (opts.sessionId) args.push('--session', opts.sessionId);
     for (const extra of this.opts.extraArgs ?? []) args.push(extra);

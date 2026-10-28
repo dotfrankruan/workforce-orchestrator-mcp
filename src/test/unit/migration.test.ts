@@ -9,7 +9,7 @@ import { makeTempDir, removeDir } from '../helpers.js';
 test('fresh database is created at current schema version', () => {
   const dir = makeTempDir('kwm-mig-');
   const store = new WorkerStore(path.join(dir, 'workers.db'));
-  assert.equal(store.schemaVersion(), 6);
+  assert.equal(store.schemaVersion(), 7);
   store.close();
   removeDir(dir);
 });
@@ -35,7 +35,7 @@ test('v1 database migrates automatically and old rows stay readable', () => {
 
   // Opening with the new store must migrate in place.
   const store = new WorkerStore(dbPath);
-  assert.equal(store.schemaVersion(), 6);
+  assert.equal(store.schemaVersion(), 7);
 
   const row = store.getWorker('wk_legacy01');
   assert.ok(row, 'legacy row still readable');

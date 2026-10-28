@@ -54,6 +54,27 @@ The registry is deterministic and never silently falls back. Selection order:
 available on the machine. An unavailable explicitly-selected backend is a clear
 error — nothing is auto-installed or silently substituted.
 
+## What's new in v0.4
+
+- **DSH model selection.** The DeepSeek Harness backend can now run a chosen
+  model — per task (`spawn_task({ model: "k3-256k" })`), per config
+  (`backends.dsh.model`), or per environment (`WORKFORCE_DSH_MODEL`). The
+  headless app has no `--model` flag, so the backend applies selection with
+  the launcher's documented `--patch` overlay on `agent-default-model`
+  (provider + model + reasoningEffort), based on facts read locally from
+  `dsh --dump-config`. No provider API is contacted to discover models.
+- **Model discovery.** New `list_models` MCP tool and `node dist/cli.js models`
+  command list the models the runtime is configured to serve plus the current
+  default. `list_backends` / `get_backend` include `models` + `default_model`.
+- **Universal per-task model.** `model` works on every backend that advertises
+  `capabilities.modelSelection` (dsh, opencode, openai, anthropic). Backends
+  that don't support it reject the parameter explicitly instead of ignoring it.
+- Per-task model is persisted (schema v7), shown in results/status, honored by
+  `continue_worker`, included in cache keys, and aggregated in
+  `get_system_metrics().models`.
+- Backend failure errors now include a bounded, redacted stderr tail — e.g.
+  invalid models surface the runtime's `UNKNOWN_MODEL` message directly.
+
 ## What's new in v0.3
 
 - Removed all vendor-specific naming. Environment variables,
@@ -74,8 +95,9 @@ error — nothing is auto-installed or silently substituted.
 npm install
 npm run build
 
-# Optional: see which backends are locally available
+# Optional: see which backends are locally available, and their models
 node dist/cli.js backends
+node dist/cli.js models
 
 # Start the MCP server on stdio
 node dist/cli.js serve   # or: npx workforce-mcp serve
@@ -158,7 +180,10 @@ single place to pin executables, choose models, and route roles.
   "backends": {
     "dsh": {
       "command": "/usr/local/bin/dsh",
-      "profile": "headless"
+      "profile": "headless",
+      "model": "k3",                 // default model for every dsh run
+      "provider": "kimi-coding",     // provider that owns the model
+      "reasoning_effort": "max"      // passed through as reasoningEffort
     },
     "opencode": {
       "command": "opencode",
@@ -215,6 +240,43 @@ a key; in that case the backend is considered available even with an empty key.
 `dsh` and `opencode` own their credentials (for example `~/.dsh/.env` and
 `opencode auth`); the orchestrator does not read or manage them.
 
+### Model selection
+
+Every backend with `capabilities.modelSelection` accepts a per-task model:
+
+```json
+{ "task": "...", "mode": "code", "model": "k3-256k" }
+```
+
+Precedence (first hit wins), per backend:
+
+1. `model` on the task / workflow task / `continue_worker`
+2. `backends.<id>.model` in `~/.workforce/config.json`
+3. `<BACKEND>_MODEL` environment variable (e.g. `WORKFORCE_DSH_MODEL`)
+4. The runtime's own default (for dsh: `agent-default-model` in the profile)
+
+Discover what is available **without spending quota** (local config only):
+
+```bash
+node dist/cli.js models          # default backend
+node dist/cli.js models dsh      # specific backend
+```
+
+The same data is exposed as the `list_models` MCP tool and inside
+`list_backends` / `get_backend` (`models`, `default_model`).
+
+**How dsh applies it.** The headless app takes no `--model` flag, so the
+backend writes a small `--patch` overlay next to the task logs
+(`dsh-model.yml`) that replaces the `agent-default-model` entry with
+`provider`, `model`, and `reasoningEffort`. Base values are read from
+`dsh --dump-config --profile <profile>` (a local command; never the network,
+never credentials). An invalid model is not swallowed: the run fails and the
+error carries the runtime message, e.g.
+`backend exited with code=1 …; stderr: dsh: UNKNOWN_MODEL: pi-ai provider "kimi-coding" has no configured model "…"`.
+
+For the other backends the override flows through their native mechanism:
+opencode `--model`, OpenAI `model` field, Anthropic `model` field.
+
 ### Environment variables
 
 | Variable | Default | Meaning |
@@ -233,6 +295,9 @@ a key; in that case the backend is considered available even with an empty key.
 | `WORKFORCE_TERMINATE_GRACE_MS` | `5000` | SIGTERM→SIGKILL grace |
 | `WORKFORCE_DSH_COMMAND` | `/usr/local/bin/dsh` or PATH | dsh executable |
 | `WORKFORCE_DSH_PROFILE` | `headless` | dsh profile |
+| `WORKFORCE_DSH_MODEL` | profile default | Default dsh model (e.g. `k3-256k`) |
+| `WORKFORCE_DSH_PROVIDER` | profile default | Provider owning the dsh model |
+| `WORKFORCE_DSH_REASONING_EFFORT` | profile default | e.g. `max` |
 | `WORKFORCE_OPENCODE_COMMAND` | `opencode` | OpenCode executable |
 | `WORKFORCE_OPENCODE_MODEL` | OpenCode default | `provider/model` |
 | `WORKFORCE_OPENCODE_AGENT` | OpenCode default | Agent name |
@@ -271,13 +336,14 @@ a key; in that case the backend is considered available even with an empty key.
 
 | Tool | Purpose |
 |---|---|
-| `spawn_task` | Spawn any mode with any workspace, deliverables, capabilities, backend. |
+| `spawn_task` | Spawn any mode with any workspace, deliverables, capabilities, backend, model. |
 | `spawn_tasks` | Batch-spawn up to 16 independent tasks. |
 | `wait_task` / `wait_tasks` | Efficient event-driven waiting (`all`/`any`). |
 | `get_task_result` | Compact result: status, summary, artifacts, deliverables, usage. |
 | `list_artifacts` / `get_artifact` / `get_artifact_metadata` | Artifact metadata and capped content. |
 | `get_task_usage` | Tokens, steps, tool calls by tool, runs, duration. |
-| `list_backends` / `get_backend` | Backend availability, capabilities, factual metadata. |
+| `list_backends` / `get_backend` | Backend availability, capabilities, factual metadata, model catalog. |
+| `list_models` | Models a backend serves + its default (local config only, no API call). |
 
 ### Workers (legacy aliases, fully supported)
 

@@ -45,6 +45,7 @@ export class FakeBackend implements WorkerBackend {
   readonly id: string;
   readonly displayName: string;
   readonly capabilities = {
+    modelSelection: true,
     continuation: true,
     durableReattach: false,
     structuredEvents: true,

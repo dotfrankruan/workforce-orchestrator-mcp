@@ -75,6 +75,8 @@ export interface CacheKeyInput {
   fingerprint: string;
   /** Runtime backend identity — results never leak across backends. */
   backendId?: string | undefined;
+  /** Per-task model — results never leak across models. */
+  model?: string | null | undefined;
 }
 
 export function computeCacheKey(input: CacheKeyInput): string {
@@ -90,6 +92,7 @@ export function computeCacheKey(input: CacheKeyInput): string {
         task: normalizeTaskText(input.task),
         ws: input.fingerprint,
         backend: input.backendId ?? 'dsh',
+        model: input.model ?? null,
       }),
     )
     .digest('hex');

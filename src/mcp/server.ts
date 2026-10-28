@@ -110,12 +110,13 @@ export function createMcpServer(supervisor: WorkerSupervisor): McpServer {
         capabilities: z.array(z.string()).optional().describe(CAPABILITIES_DESC),
         timeout_seconds: z.number().int().positive().optional().describe(TIMEOUT_DESC),
         backend: z.string().optional().describe('Runtime backend id (see list_backends). Default: "auto" selects the configured default or the first locally available backend (dsh, opencode, openai, anthropic).'),
+        model: z.string().optional().describe('Per-task model override, e.g. "k3-256k" or "kimi-for-coding" for dsh (use list_models to see options). Omit for the backend/profile default.'),
       },
       annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
     },
-    async ({ task, mode, workspace, deliverables, capabilities, timeout_seconds, backend }) => {
+    async ({ task, mode, workspace, deliverables, capabilities, timeout_seconds, backend, model }) => {
       try {
-        const result = supervisor.spawnTask({ task, mode, workspace, deliverables, capabilities, timeout_seconds, backend });
+        const result = supervisor.spawnTask({ task, mode, workspace, deliverables, capabilities, timeout_seconds, backend, model });
         return jsonResult(result);
       } catch (err) {
         return errorResult(err);
@@ -134,6 +135,23 @@ export function createMcpServer(supervisor: WorkerSupervisor): McpServer {
     async () => {
       try {
         return jsonResult({ backends: supervisor.listBackends() });
+      } catch (err) {
+        return errorResult(err);
+      }
+    },
+  );
+
+  server.registerTool(
+    'list_models',
+    {
+      title: 'List models',
+      description: 'Models a backend is configured to serve, plus its default selection. Read from the runtime\'s own local config (no provider API call, no quota usage). Omit backend_id for the default backend.',
+      inputSchema: { backend_id: z.string().optional().describe('Backend id (see list_backends). Default: the router default backend.') },
+      annotations: READ_ONLY,
+    },
+    async ({ backend_id }) => {
+      try {
+        return jsonResult(supervisor.listModels(backend_id));
       } catch (err) {
         return errorResult(err);
       }
@@ -299,6 +317,8 @@ export function createMcpServer(supervisor: WorkerSupervisor): McpServer {
                   retry_on: z.array(z.enum(['failed', 'timeout'])).optional(),
                 })
                 .optional(),
+              backend: z.string().optional().describe('Runtime backend id for this task (see list_backends). Default: router.'),
+              model: z.string().optional().describe('Per-task model override (see list_models). Default: backend/profile default.'),
             }),
           )
           .min(1)
@@ -794,13 +814,14 @@ export function createMcpServer(supervisor: WorkerSupervisor): McpServer {
       inputSchema: {
         worker_id: z.string().describe(ID_DESC),
         instruction: z.string().describe('Follow-up instruction, e.g. review feedback to apply. Be specific about what to change; the worker retains full context of its previous work in this session.'),
+        model: z.string().optional().describe('Optional per-task model override for this continuation (kept if omitted).'),
       },
       annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
     },
-    async ({ worker_id, instruction }) => {
+    async ({ worker_id, instruction, model }) => {
       try {
         requireWorkerId(worker_id);
-        const result = await supervisor.continueWorker(worker_id, instruction);
+        const result = await supervisor.continueWorker(worker_id, instruction, { model });
         return jsonResult(result);
       } catch (err) {
         return errorResult(err);

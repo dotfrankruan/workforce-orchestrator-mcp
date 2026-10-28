@@ -142,7 +142,8 @@ Usage:
   workforce-mcp roles                 List role templates
   workforce-mcp presets               List workflow presets
   workforce-mcp cache-stats           Artifact cache stats
-  workforce-mcp backends              List runtime backends
+  workforce-mcp backends              List runtime backends (+ models)
+  workforce-mcp models [backend]      List models a backend serves
   workforce-mcp backend <id>          Show backend details
 
 Configuration (environment variables):
@@ -361,6 +362,13 @@ async function main(): Promise<void> {
     case 'cache-stats': {
       const { supervisor, store } = openSupervisor();
       printJson(supervisor.cacheStats());
+      store.close();
+      break;
+    }
+
+    case 'models': {
+      const { supervisor, store } = openSupervisor();
+      printJson(supervisor.listModels(rest[0]));
       store.close();
       break;
     }

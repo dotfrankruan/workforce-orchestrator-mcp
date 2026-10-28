@@ -57,7 +57,7 @@ test('every tool has a meaningful description', async () => {
   const { client, cleanup } = await connectClient();
   try {
     const { tools } = await client.listTools();
-    assert.equal(tools.length, 33, 'all 33 tools registered');
+    assert.equal(tools.length, 34, 'all 34 tools registered');
     for (const tool of tools) {
       const desc = tool.description ?? '';
       assert.ok(desc.length >= 60, `${tool.name} description too short (${desc.length} chars)`);

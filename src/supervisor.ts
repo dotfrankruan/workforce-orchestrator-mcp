@@ -116,6 +116,8 @@ export interface SpawnTaskParams {
   retry?: { max_attempts: number; retry_on?: string[] } | undefined;
   /** Explicit runtime backend id (see list_backends). Default: router → dsh. */
   backend?: string | undefined;
+  /** Per-task model override (backend must advertise capabilities.modelSelection). */
+  model?: string | undefined;
 }
 
 export interface SpawnTaskResult {
@@ -127,6 +129,8 @@ export interface SpawnTaskResult {
   session_id: string | null;
   queued: boolean;
   backend: string;
+  /** Effective per-task model (null = backend/profile default). */
+  model: string | null;
   cache?: { hit: boolean; source_task_id?: string; age_seconds?: number; artifacts_reused?: number; artifact_bytes?: number } | undefined;
 }
 
@@ -254,6 +258,52 @@ export class WorkerSupervisor {
     backend: WorkerBackend | BackendRegistry,
   ) {
     this.registry = backend instanceof BackendRegistry ? backend : new BackendRegistry(backend);
+  }
+
+  /**
+   * Facts-only backend metadata for a run: runtime identity plus the provider
+   * and effective model. Values come from the backend's configured/discovered
+   * runtime config — never guessed, never from provider APIs.
+   */
+  private backendMetadataFor(backend: WorkerBackend, model: string | null): Record<string, unknown> {
+    const base = backend.metadata?.() ?? {};
+    const rt = backend.inspectRuntime?.() ?? null;
+    const provider = rt?.default?.provider ?? base.provider?.name;
+    const effectiveModel = model ?? rt?.default?.model ?? base.provider?.model;
+    return {
+      ...base,
+      provider: {
+        ...(provider ? { name: provider } : {}),
+        ...(effectiveModel ? { model: effectiveModel } : {}),
+      },
+    };
+  }
+
+  /** Bounded tail of stderr.log for failure reporting (credentials redacted). */
+  private stderrTail(row: WorkerRow, maxChars = 400): string | null {
+    try {
+      const p = path.join(row.log_dir, 'stderr.log');
+      const size = fs.statSync(p).size;
+      if (size === 0) return null;
+      const readBytes = Math.min(size, 4096);
+      const fd = fs.openSync(p, 'r');
+      const buf = Buffer.alloc(readBytes);
+      fs.readSync(fd, buf, 0, readBytes, size - readBytes);
+      fs.closeSync(fd);
+      const text = redactSecrets(buf.toString('utf8')).replace(/\s+/g, ' ').trim();
+      if (!text) return null;
+      return text.length > maxChars ? `…${text.slice(-maxChars)}` : text;
+    } catch {
+      return null;
+    }
+  }
+
+  private safeJson(raw: string): unknown {
+    try {
+      return JSON.parse(raw);
+    } catch {
+      return null;
+    }
   }
 
   /** The backend assigned to a task row (tolerant: unknown/legacy ids fall
@@ -681,6 +731,12 @@ export class WorkerSupervisor {
     // is deliberately NO automatic fallback to another backend.
     const backend = this.registry.resolveAvailable({ backend: params.backend, role: params.role ?? null });
 
+    // Per-task model selection (backend capability gated — never silently ignored).
+    const model = params.model?.trim() || null;
+    if (model && !backend.capabilities.modelSelection) {
+      throw new Error(`backend "${backend.id}" does not support per-task model selection`);
+    }
+
     // Unique worker id (collision-proof against the db).
     let id = newWorkerId();
     while (this.store.getWorker(id) !== null) id = newWorkerId();
@@ -751,7 +807,8 @@ export class WorkerSupervisor {
       retry_on: JSON.stringify(retryOn),
       initialStatus: dependsOn.length > 0 ? 'waiting_dependencies' : 'queued',
       backend_id: backend.id,
-      backend_metadata: JSON.stringify(backend.metadata?.() ?? {}),
+      backend_metadata: JSON.stringify(this.backendMetadataFor(backend, model)),
+      model,
     });
     if (taskBranch || integrationStatus) {
       this.store.updateWorker(id, {
@@ -777,6 +834,7 @@ export class WorkerSupervisor {
         task: params.task,
         fingerprint,
         backendId: backend.id,
+        model,
       });
       // Persisted so finalize can write the entry even after a restart.
       this.store.addEvent(id, 'cache_key', JSON.stringify({ key, fingerprint }));
@@ -851,6 +909,7 @@ export class WorkerSupervisor {
       session_id: row.session_id,
       queued: row.status === 'queued',
       backend: backend.id,
+      model,
       ...(cacheInfo ? { cache: cacheInfo } : {}),
     };
   }
@@ -1441,19 +1500,8 @@ export class WorkerSupervisor {
 
   /* ------------------------------ backends ------------------------------ */
 
-  listBackends(): Array<Record<string, unknown>> {
-    return this.registry.list().map((b) => ({
-      id: b.id,
-      display_name: b.displayName,
-      available: b.isAvailable(),
-      default: b.id === this.registry.defaultBackendId,
-      capabilities: b.capabilities,
-      metadata: b.metadata?.() ?? null,
-    }));
-  }
-
-  getBackend(id: string): Record<string, unknown> {
-    const b = this.registry.get(id);
+  private backendSummary(b: WorkerBackend): Record<string, unknown> {
+    const runtime = b.inspectRuntime?.() ?? null;
     return {
       id: b.id,
       display_name: b.displayName,
@@ -1461,6 +1509,36 @@ export class WorkerSupervisor {
       default: b.id === this.registry.defaultBackendId,
       capabilities: b.capabilities,
       metadata: b.metadata?.() ?? null,
+      // Model catalog discovered from the runtime's own config (facts only).
+      models: runtime?.models ?? [],
+      default_model: runtime?.default ?? null,
+    };
+  }
+
+  listBackends(): Array<Record<string, unknown>> {
+    return this.registry.list().map((b) => this.backendSummary(b));
+  }
+
+  getBackend(id: string): Record<string, unknown> {
+    return this.backendSummary(this.registry.get(id));
+  }
+
+  /**
+   * Models a backend is configured to serve (local runtime config only — no
+   * provider API call, no quota usage). `backend_id` defaults to the router
+   * default.
+   */
+  listModels(backendId?: string): Record<string, unknown> {
+    const id = backendId?.trim() || this.registry.defaultBackendId;
+    const b = this.registry.get(id);
+    const runtime = b.inspectRuntime?.() ?? null;
+    return {
+      backend: b.id,
+      model_selection: b.capabilities.modelSelection,
+      available: b.isAvailable(),
+      models: runtime?.models ?? [],
+      default: runtime?.default ?? null,
+      ...(runtime ? {} : { note: 'runtime model catalog unavailable (backend has no local config discovery)' }),
     };
   }
 
@@ -1685,16 +1763,30 @@ export class WorkerSupervisor {
         tasks: b.tasks,
         tokens: { input: b.input, output: b.output, cache_read: b.cache_read },
       })),
+      models: this.store.modelAgg().map((m) => ({
+        backend: m.backend_id,
+        model: m.model ?? 'default',
+        tasks: m.tasks,
+        tokens: { input: m.input, output: m.output, cache_read: m.cache_read },
+      })),
     };
   }
 
   /* ------------------------------------------------------------------ */
 
-  async continueWorker(workerId: string, instruction: string): Promise<{ worker_id: string; status: WorkerStatus; session_id: string | null }> {
+  async continueWorker(
+    workerId: string,
+    instruction: string,
+    opts: { model?: string | undefined } = {},
+  ): Promise<{ worker_id: string; status: WorkerStatus; session_id: string | null }> {
     if (!instruction || instruction.trim() === '') {
       throw new Error('instruction must be a non-empty string');
     }
     const row = this.get(workerId);
+    const continueModel = opts.model?.trim() || null;
+    if (continueModel && !this.backendFor(row).capabilities.modelSelection) {
+      throw new Error(`backend "${row.backend_id}" does not support per-task model selection`);
+    }
     if (this.active.has(workerId) || row.status === 'running' || row.status === 'starting' || row.status === 'queued' || row.status === 'waiting_dependencies') {
       throw new Error(`worker ${workerId} is still active; cancel it or wait for completion before continuing`);
     }
@@ -1740,6 +1832,7 @@ export class WorkerSupervisor {
       status: 'queued',
       error: null,
       continue_count: row.continue_count + 1,
+      ...(continueModel ? { model: continueModel } : {}),
     });
     this.store.addEvent(workerId, 'continue', instruction.slice(0, MAX_EVENT_SUMMARY));
     this.schedule();
@@ -2081,6 +2174,7 @@ export class WorkerSupervisor {
           sessionId: opts.resumeSessionId,
           stdoutPath,
           stderrPath,
+          ...(row.model ? { model: row.model } : {}),
         },
         {
           onEvent: (ev) => this.handleEvent(row.id, ev, usage),
@@ -2557,7 +2651,9 @@ export class WorkerSupervisor {
       provisionalError = `exceeded timeout of ${row.timeout_seconds ?? this.config.defaultTimeoutSeconds}s`;
     } else if (exitCode !== null && exitCode !== 0) {
       provisional = 'failed';
-      provisionalError = `backend exited with code=${exitCode} signal=${signal ?? 'null'}`;
+      const stderrTail = this.stderrTail(row);
+      provisionalError =
+        `backend exited with code=${exitCode} signal=${signal ?? 'null'}` + (stderrTail ? `; stderr: ${stderrTail}` : '');
     } else if (run.detached && exitCode === null) {
       // Reattached run: no ChildProcess handle, so no exit code. Durable
       // evidence decides — a final event means normal completion; otherwise
@@ -2957,6 +3053,7 @@ export class WorkerSupervisor {
       acceptance: row.acceptance,
       role: row.role,
       backend: row.backend_id,
+      model: row.model,
       session_id: row.session_id,
       backend_session_id: row.session_id,
       workspace: { type: row.workspace_type, path: row.worktree_path },
@@ -3011,6 +3108,7 @@ export class WorkerSupervisor {
           : null,
       };
     }
+    out['backend_metadata'] = row.backend_metadata ? this.safeJson(row.backend_metadata) : null;
     if (row.error) out['error'] = redactSecrets(row.error);
     if (row.exit_code !== null) out['exit_code'] = row.exit_code;
     // Backend-exhaustion handoff metadata (Part 26): facts only, no guessing.

@@ -29,6 +29,12 @@ import type { WorkerBackend } from './types.js';
 export interface DshFileConfig {
   command?: string;
   profile?: string;
+  /** Default model for dsh runs (e.g. k3, k3-256k, kimi-for-coding). */
+  model?: string;
+  /** Provider that owns the model (e.g. kimi-coding). */
+  provider?: string;
+  /** Reasoning effort (e.g. max). */
+  reasoning_effort?: string;
 }
 
 export interface OpenCodeFileConfig {
@@ -321,7 +327,14 @@ export function createDefaultRegistry(
   const exe = resolveDshExecutable(config, fileConfig);
   const profile =
     fileConfig?.backends?.dsh?.profile ?? env.WORKFORCE_DSH_PROFILE ?? config.dshProfile;
-  const dsh = new DshBackend({ dshBin: exe.command ?? config.dshBin, profile });
+  const dshCfg = fileConfig?.backends?.dsh;
+  const dsh = new DshBackend({
+    dshBin: exe.command ?? config.dshBin,
+    profile,
+    model: dshCfg?.model ?? env.WORKFORCE_DSH_MODEL,
+    provider: dshCfg?.provider ?? env.WORKFORCE_DSH_PROVIDER,
+    reasoningEffort: dshCfg?.reasoning_effort ?? env.WORKFORCE_DSH_REASONING_EFFORT,
+  });
 
   // OpenCode
   const oc = fileConfig?.backends?.opencode;

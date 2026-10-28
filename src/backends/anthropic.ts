@@ -58,9 +58,9 @@ export class AnthropicBackend extends ApiAgentBackend implements WorkerBackend {
     return headers;
   }
 
-  protected async requestTurn(signal: AbortSignal): Promise<ProviderTurn> {
+  protected async requestTurn(signal: AbortSignal, model: string): Promise<ProviderTurn> {
     const body: Json = {
-      model: this.opts.model,
+      model,
       max_tokens: this.opts.maxOutputTokens ?? 8192,
       system: this.basePrompt(),
       messages: this.messages,

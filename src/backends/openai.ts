@@ -56,8 +56,8 @@ export class OpenAIBackend extends ApiAgentBackend implements WorkerBackend {
     this.input = [{ role: 'user', content: prompt }];
   }
 
-  protected async requestTurn(signal: AbortSignal): Promise<ProviderTurn> {
-    return this.apiStyle === 'responses' ? this.responsesTurn(signal) : this.chatTurn(signal);
+  protected async requestTurn(signal: AbortSignal, model: string): Promise<ProviderTurn> {
+    return this.apiStyle === 'responses' ? this.responsesTurn(signal, model) : this.chatTurn(signal, model);
   }
 
   private headers(): Record<string, string> {
@@ -66,9 +66,9 @@ export class OpenAIBackend extends ApiAgentBackend implements WorkerBackend {
     return headers;
   }
 
-  private async chatTurn(signal: AbortSignal): Promise<ProviderTurn> {
+  private async chatTurn(signal: AbortSignal, model: string): Promise<ProviderTurn> {
     const body: Json = {
-      model: this.opts.model,
+      model,
       messages: this.messages,
       tools: AGENT_TOOLS.map((t) => ({
         type: 'function',
@@ -140,7 +140,7 @@ export class OpenAIBackend extends ApiAgentBackend implements WorkerBackend {
     }));
   }
 
-  private async responsesTurn(signal: AbortSignal): Promise<ProviderTurn> {
+  private async responsesTurn(signal: AbortSignal, model: string): Promise<ProviderTurn> {
     const body: Json = {
       model: this.opts.model,
       instructions: this.basePrompt(),
