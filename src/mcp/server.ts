@@ -1,4 +1,5 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { packageVersion } from '../version.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
 import { WorkerSupervisor, elapsedSeconds } from '../supervisor.js';
@@ -76,7 +77,7 @@ const MODE_DESC =
 
 export function createMcpServer(supervisor: WorkerSupervisor): McpServer {
   const server = new McpServer(
-    { name: 'workforce-orchestrator-mcp', version: '0.3.0' },
+    { name: 'workforce-orchestrator-mcp', version: packageVersion() },
     { capabilities: { logging: {} }, instructions: SERVER_INSTRUCTIONS },
   );
 

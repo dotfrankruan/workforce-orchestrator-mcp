@@ -54,7 +54,7 @@ The registry is deterministic and never silently falls back. Selection order:
 available on the machine. An unavailable explicitly-selected backend is a clear
 error — nothing is auto-installed or silently substituted.
 
-## What's new in v0.4
+## What's new in v5.1
 
 - **DSH model selection.** The DeepSeek Harness backend can now run a chosen
   model — per task (`spawn_task({ model: "k3-256k" })`), per config
@@ -75,7 +75,7 @@ error — nothing is auto-installed or silently substituted.
 - Backend failure errors now include a bounded, redacted stderr tail — e.g.
   invalid models surface the runtime's `UNKNOWN_MODEL` message directly.
 
-## What's new in v0.3
+### Expanded backend support (part of v5.1)
 
 - Removed all vendor-specific naming. Environment variables,
   branches, state paths, package/bin names, and messages are now universal.

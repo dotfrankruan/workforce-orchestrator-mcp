@@ -1,6 +1,6 @@
 {
   "name": "workforce-orchestrator-mcp",
-  "version": "0.4.0",
+  "version": "5.1.0",
   "description": "Universal MCP orchestrator that lets Codex delegate coding/research/data/docs/file/ops/review tasks to pluggable runtime backends (DeepSeek Harness, OpenCode) or direct OpenAI/Anthropic APIs",
   "license": "Apache-2.0",
   "type": "module",
